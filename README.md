@@ -73,7 +73,7 @@ If you already had a `statusLine` command, save it as a small shell script at `~
 The tool is built to be invisible on a busy machine — everything is event-driven, nothing polls:
 
 - The hotkey daemon sits at 0% CPU (Carbon hotkey + app-activation callbacks, no event tap, no timers) and ~30 MB RSS.
-- The statusline wrapper adds about 10 ms of pure bash on top of whatever your own chained statusline costs; an interpreter is spawned only while a queue is actually non-empty.
+- The statusline wrapper adds about 10 ms of pure bash on top of whatever your own chained statusline costs; an interpreter is spawned only in the one session that owns a non-empty queue (other sessions get a plutil lookup in single-digit milliseconds).
 - The capture hot path (hotkey → box cleared) spawns exactly one Python process — session lookup, event-log check, screen scrape and box parse all happen inside it — plus two cmux socket calls. Interpreter startup dominates this path on a loaded machine, which is why it is one process instead of four.
 - The notification hook answers cmux with a pure-bash passthrough for every foreign notification, so it never delays your notifications; JSON rewriting runs only for the tool's own invisible retry ticks.
 - Delivery attempts are triggered by turn-complete notifications and by the statusline retry tick (rate-limited to one per 15 s, and only while a queue is non-empty). With empty queues the tool does no periodic work at all.
