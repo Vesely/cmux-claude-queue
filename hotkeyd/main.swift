@@ -18,7 +18,11 @@ let targetBundleIDs: Set<String> = [
     "com.cmuxterm.app",
     // "com.mitchellh.ghostty",  // future: needs a Ghostty capture backend first
 ]
-let captureScript = ("~/.local/bin/cmux-claude-queue" as NSString).expandingTildeInPath
+// The LaunchAgent passes the installed script path as argv[1] (BIN_DIR can be
+// customized at install time); the ~/.local/bin default covers manual runs.
+let captureScript: String = CommandLine.arguments.count > 1
+    ? CommandLine.arguments[1]
+    : ("~/.local/bin/cmux-claude-queue" as NSString).expandingTildeInPath
 // Instant audible ack: the capture itself takes up to ~1 s on a loaded machine
 // (three serial cmux socket calls), during which nothing visible happens yet.
 // Touch this file to disable the sound.
@@ -51,8 +55,14 @@ final class HotkeyDaemon {
         let wanted = frontmost.map(targetBundleIDs.contains) ?? false
         if wanted && hotKeyRef == nil {
             let hotKeyID = EventHotKeyID(signature: OSType(0x4351_4844), id: 1) // "CQHD"
-            RegisterEventHotKey(UInt32(kVK_Return), UInt32(optionKey),
-                                hotKeyID, GetEventDispatcherTarget(), 0, &hotKeyRef)
+            let status = RegisterEventHotKey(UInt32(kVK_Return), UInt32(optionKey),
+                                             hotKeyID, GetEventDispatcherTarget(), 0, &hotKeyRef)
+            if status != noErr {
+                // e.g. another app owns Opt+Return system-wide; without this the
+                // hotkey would just silently never fire (err log via LaunchAgent)
+                FileHandle.standardError.write(Data("RegisterEventHotKey failed: \(status)\n".utf8))
+                hotKeyRef = nil
+            }
         } else if !wanted, let ref = hotKeyRef {
             UnregisterEventHotKey(ref)
             hotKeyRef = nil
@@ -83,7 +93,9 @@ final class HotkeyDaemon {
         p.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async { self?.children.remove(proc) }
         }
-        do { try p.run(); children.insert(p) } catch {}
+        do { try p.run(); children.insert(p) } catch {
+            FileHandle.standardError.write(Data("capture spawn failed: \(error)\n".utf8))
+        }
     }
 }
 

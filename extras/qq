@@ -20,7 +20,9 @@ surface="${CMUX_SURFACE_ID:-}"
 [ -n "$surface" ] || { echo "qq: CMUX_SURFACE_ID not set (not inside cmux)"; exit 1; }
 [ $# -gt 0 ] || { echo "usage: !qq <text>"; exit 1; }
 
-CQ="$HOME/.local/bin/cmux-claude-queue"
+CQ=$(command -v cmux-claude-queue || true)
+[ -n "$CQ" ] || CQ="$HOME/.local/bin/cmux-claude-queue"
+[ -x "$CQ" ] || { echo "qq: cmux-claude-queue not found (PATH or ~/.local/bin)"; exit 1; }
 CMUX_BIN="cmux"
 command -v "$CMUX_BIN" >/dev/null 2>&1 || CMUX_BIN="/Applications/cmux.app/Contents/Resources/bin/cmux"
 
@@ -28,6 +30,9 @@ command -v "$CMUX_BIN" >/dev/null 2>&1 || CMUX_BIN="/Applications/cmux.app/Conte
 # command runs the TUI buffers them into a queued message that submits a turn
 # later, which shows up as a phantom duplicate. The invisible tick makes the
 # notification hook deliver right after this process exits.
-"$CQ" enqueue "$surface" "$@" >/dev/null 2>&1
+if ! "$CQ" enqueue "$surface" "$@" >/dev/null 2>&1; then
+  echo "qq: enqueue FAILED — the prompt was NOT saved"
+  exit 1
+fi
 "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$surface" >/dev/null 2>&1
 echo "qq: queued, delivers after the current turn"

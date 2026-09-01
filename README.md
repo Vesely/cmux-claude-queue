@@ -56,9 +56,9 @@ cd cmux-claude-queue
 ./install.sh
 ```
 
-The installer symlinks `bin/cmux-claude-queue` into `~/.local/bin`, builds the daemon, and loads the `com.cmux-claude-queue.hotkeyd` LaunchAgent. It then prints the two config snippets you need to add yourself:
+The installer copies `bin/cmux-claude-queue` into `~/.local/bin` (re-run it after a `git pull` to upgrade; `./install.sh --dev` symlinks instead so repo edits go live), builds the daemon, and loads the `com.cmux-claude-queue.hotkeyd` LaunchAgent. It then prints the two config snippets you need to add yourself:
 
-1. **`~/.config/cmux/cmux.json`** — set `automation.socketControlMode` to `"password"` with a generated `automation.socketPassword` (the hotkey daemon is not a cmux child process, and cmux's default `cmuxOnly` socket mode rejects it; the cmux CLI auto-authenticates using the stored password), and register `cmux-claude-queue notifyhook` under `notifications.hooks`. Run `cmux reload-config` afterwards.
+1. **`~/.config/cmux/cmux.json`** — set `automation.socketControlMode` to `"password"` with a generated `automation.socketPassword` (the hotkey daemon is not a cmux child process, and cmux's default `cmuxOnly` socket mode rejects it; the cmux CLI auto-authenticates using the stored password), and register `cmux-claude-queue notifyhook` under `notifications.hooks`. Run `cmux reload-config` afterwards. Be aware of the trade-off: password mode means any process that can read your `cmux.json` can control your cmux terminals — that file is `600` in your home directory, so this is the same trust boundary as your shell startup files, but it is a wider gate than the default `cmuxOnly` mode.
 2. **`~/.claude/settings.json`** — point `statusLine.command` at `cmux-claude-queue statusline` with `refreshInterval: 2`.
 
 If you already had a `statusLine` command, save it as a small shell script at `~/.config/cmux-claude-queue/statusline-chain` (it receives the statusline JSON on stdin); its output stays on top and the queue row is appended below. The chain runs only in a detached background job that refreshes a per-session cache every ~10 s, so the short refresh interval makes the queue row show up fast while your own statusline runs *less* often than the usual 5 s cadence — and a slow statusline can no longer be killed mid-run by the refresh cycle.
@@ -102,6 +102,8 @@ rm ~/Library/LaunchAgents/com.cmux-claude-queue.hotkeyd.plist
 rm ~/.local/bin/cmux-claude-queue ~/.local/bin/cmux-claude-queue-hotkeyd
 rm -rf ~/.claude/prompt-queue ~/.config/cmux-claude-queue
 ```
+
+(If you installed with `CMUX_CLAUDE_QUEUE_BIN_DIR` set, remove the two binaries from that directory instead of `~/.local/bin`.)
 
 Then remove the `notifications.hooks` entry (and, if you wish, the `automation` block) from `cmux.json` and restore your previous `statusLine` in Claude Code's `settings.json`.
 

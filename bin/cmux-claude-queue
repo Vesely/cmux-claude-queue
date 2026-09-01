@@ -237,9 +237,10 @@ events_running() {
 # Hook events are the primary truth (newest UserPromptSubmit vs Stop), BUT an
 # Esc interrupt emits NO Stop hook, no sidebar update and no notification
 # (verified in events.jsonl) — both the store and the events stay
-# "running" forever. A hook-based running verdict older than 90 s is therefore
-# reported as "stale" and the caller re-checks the live TUI screen. With no
-# usable events the store's agentLifecycle decides.
+# "running" forever. A hook-based running verdict older than 30 s is therefore
+# reported as "stale" and the caller re-checks the live TUI screen (30 s keeps
+# the worst post-Esc stall short while still trusting fresh hook data). With
+# no usable events the store's agentLifecycle decides.
 # Prints "<sid>\x1f<idle|running|stale>".
 session_state() {
   python3 - "$STORE" "$1" "$EVENTS" <<'PY' 2>/dev/null
@@ -286,7 +287,7 @@ if sid:
                 age = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
             except Exception:
                 age = 0
-            verdict = "running" if age < 90 else "stale"
+            verdict = "running" if age < 30 else "stale"
 if verdict == "unknown":
     verdict = "running" if lifecycle == "running" else "idle"
 print(sid + "\x1f" + verdict)
@@ -323,6 +324,69 @@ for raw in sys.stdin:
 sys.exit(1)' "claude-$sid" "$line" "$strict"
 }
 
+# Wait up to ~6 s for the submit confirmation, polling inside ONE python
+# process. Always strict (length match): a loose "any submit counts" check
+# let a foreign submit inside the window confirm a delivery whose keys never
+# landed — the queued line was then popped without ever running. The old
+# shell loop also spawned a fresh interpreter every 0.5 s, up to 12 per
+# delivery, each 20-300 ms of startup under load.
+confirm_wait() {
+  python3 - "$EVENTS" "claude-$1" "$2" "$3" <<'PY' 2>/dev/null
+import json, sys, time
+events, sid, offset, text = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+lens = {len(json.dumps({"prompt": text}, separators=(",", ":"))),
+        len(json.dumps({"prompt": text}, separators=(",", ":"), ensure_ascii=False))}
+deadline = time.monotonic() + 6.0
+pos = offset
+while True:
+    try:
+        with open(events, "rb") as f:
+            f.seek(pos)
+            chunk = f.read()
+    except Exception:
+        chunk = b""
+    if chunk:
+        nl = chunk.rfind(b"\n")  # complete lines only; tail re-read next poll
+        if nl >= 0:
+            for raw in chunk[:nl].splitlines():
+                if b"UserPromptSubmit" not in raw or sid.encode() not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    continue
+                p = d.get("payload") or {}
+                if d.get("name") == "agent.hook.UserPromptSubmit" \
+                   and p.get("session_id") == sid \
+                   and p.get("tool_input_length") in lens:
+                    sys.exit(0)
+            pos += nl + 1
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.4)
+PY
+}
+
+# Queue files are appended by capture/add/enqueue and rewritten by the
+# delivery pop; an append landing between the pop's read and its rename
+# would vanish with the rewritten file. This tiny lock serializes just those
+# few milliseconds on both sides. A holder can be SIGKILLed at any line, so
+# a lock older than 5 s is stolen.
+qlock_take() {
+  local ql="$QDIR/$1.qlock" tries=0
+  until mkdir "$ql" 2>/dev/null; do
+    if [ -z "$(/usr/bin/find "$ql" -newermt '-5 seconds' 2>/dev/null)" ]; then
+      rm -rf "$ql"
+      continue
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -ge 20 ] && return 1
+    sleep 0.05
+  done
+  return 0
+}
+qlock_drop() { rm -rf "$QDIR/$1.qlock"; }
+
 # Try to deliver the first queued line for a surface. Lock-guarded so capture,
 # the notification hook and a manual drain never double-deliver. Returns 0 when
 # the line was confirmed delivered, 1 otherwise (line stays queued for the next
@@ -336,20 +400,29 @@ deliver_once() {
   local afile="$QDIR/$surface.attempt"
   local line box sid ctx verdict offset delivered oldpid
 
-  line=$(head -n 1 "$qfile" 2>/dev/null || true)
-  [ -z "$line" ] && return 0
+  [ -s "$qfile" ] || return 0
 
-  if ! mkdir "$lock" 2>/dev/null; then
-    oldpid=$(cat "$lock/pid" 2>/dev/null || true)
+  # Atomic lock with the owner pid embedded: ln -s creates name and content
+  # in one syscall, so the lock can never exist without a readable owner.
+  # (The old mkdir + pid-file scheme had a window before the pid write where
+  # a second hook read an empty pid, judged the lock stale and stole it —
+  # two deliverers typing into the same surface at once.)
+  if ! ln -s "$$" "$lock" 2>/dev/null; then
+    oldpid=$(readlink "$lock" 2>/dev/null || true)
     if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
       return 1  # someone else is delivering right now
     fi
     rm -rf "$lock"
-    mkdir "$lock" 2>/dev/null || return 1
+    ln -s "$$" "$lock" 2>/dev/null || return 1
   fi
-  echo $$ > "$lock/pid"
   # no RETURN trap here: it would fire on every nested function return; a stale
   # lock after a crash is recovered by the pid-liveness check above
+
+  # the head is read under the lock: read earlier, a concurrent deliverer may
+  # pop meanwhile and this process would resend the popped line and then pop
+  # its unseen successor (duplicate + loss)
+  line=$(head -n 1 "$qfile" 2>/dev/null || true)
+  [ -z "$line" ] && { rm -rf "$lock"; return 0; }
 
   ctx=$(session_state "$surface")
   sid=${ctx%%$'\x1f'*}
@@ -371,9 +444,11 @@ deliver_once() {
       #   "(3s · esc to interrupt)"                             early form
       #   "◯ general-purpose  Doing X … 6m 57s · ↓ 110.0k tokens"  subagent,
       #                                            NO parentheses (hit live)
+      # also refuse on a pending tool-permission dialog: it renders with no
+      # spinner or timer, and an Enter sent into it would answer the dialog
       if "$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null | python3 -c '
 import re, sys
-sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]", sys.stdin.read()) else 1)
+sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]|Do you want to|don.t ask again", sys.stdin.read()) else 1)
 '; then rm -rf "$lock"; return 1; fi ;;
   esac
 
@@ -391,8 +466,11 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
      && [ "$(sed -n 2p "$afile")" = "$line" ] \
      && confirm_submit "$sid" "$(sed -n 1p "$afile")" "$line" strict; then
     log "deliver surface=$surface late-confirmed, not resending: $line"
-    tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
-    rm -f "$afile"
+    if qlock_take "$surface"; then
+      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
+        && rm -f "$afile"
+      qlock_drop "$surface"
+    fi
     rm -rf "$lock"
     return 0
   fi
@@ -406,21 +484,33 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   fi
 
   offset=$(wc -c < "$EVENTS" 2>/dev/null || echo 0)
-  "$CMUX_BIN" send --surface "$surface" $'\x15' >>"$QDIR/log.txt" 2>&1 \
-    || log "deliver surface=$surface send clear rc=$?"
+  "$CMUX_BIN" send --surface "$surface" $'\x15' >>"$QDIR/log.txt" 2>&1 || {
+    # surface gone or rejecting input (cmux restart, closed pane): skip the
+    # whole confirm cycle instead of burning ~7 s against it every tick
+    log "deliver surface=$surface send clear failed, skipping"
+    rm -rf "$lock"
+    return 1
+  }
   "$CMUX_BIN" send --surface "$surface" "$line" >>"$QDIR/log.txt" 2>&1 \
     || log "deliver surface=$surface send text rc=$?"
-  sleep 0.5
+  # Verify the box holds exactly what was typed before committing the Enter:
+  # keystrokes the user typed into the send gap would otherwise be submitted
+  # inside the queued prompt (worst failure mode). The read also serves as
+  # the settle delay the old blind sleep provided. A partially rendered box
+  # shows as a prefix of the line and is accepted; anything else aborts and
+  # leaves the typed text visible in the box for the user to resolve.
+  box=$(read_box "$surface")
+  case "$line" in
+    "$box"*) : ;;
+    *)
+      log "deliver surface=$surface box diverged after typing, not submitting"
+      rm -rf "$lock"
+      return 1 ;;
+  esac
   "$CMUX_BIN" send-key --surface "$surface" enter >>"$QDIR/log.txt" 2>&1 \
     || log "deliver surface=$surface send enter rc=$?"
   delivered=""
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    sleep 0.5
-    if [ -n "$sid" ] && confirm_submit "$sid" "$offset" "$line"; then
-      delivered=yes
-      break
-    fi
-  done
+  if confirm_wait "$sid" "$offset" "$line"; then delivered=yes; fi
 
   if [ -n "$delivered" ]; then
     # Record the confirmed submit BEFORE popping: this process can be killed
@@ -428,8 +518,13 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     # duplicate prompt. With the record, the next tick takes the late-confirm
     # path above and pops without resending.
     { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
-    tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
-      || log "deliver surface=$surface pop failed, next tick will late-confirm"
+    if qlock_take "$surface"; then
+      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
+        || log "deliver surface=$surface pop failed, next tick will late-confirm"
+      qlock_drop "$surface"
+    else
+      log "deliver surface=$surface pop skipped (queue busy), next tick will late-confirm"
+    fi
     log "deliver surface=$surface delivered: $line"
     rm -rf "$lock"
     return 0
@@ -449,8 +544,9 @@ case "$cmd" in
     # transient "⏳ Queue: …" row, which turns into the real queued row once
     # the draft lands in a queue file. Removed on every exit path (trap),
     # with a short mtime TTL in the statusline as the crash guard.
-    touch "$QDIR/capturing.stamp"
-    trap 'rm -f "$QDIR/capturing.stamp"' EXIT
+    cstamp="$QDIR/capturing.stamp"
+    touch "$cstamp"
+    trap 'rm -f "$cstamp"' EXIT
     ws="${CMUX_WORKSPACE_ID:-}"
     if [ -z "$ws" ]; then
       # invoked outside a cmux terminal (hotkey daemon): target the workspace
@@ -479,6 +575,12 @@ case "$cmd" in
       exit 0
     fi
 
+    # narrow the transient row to the captured surface's own statusline; the
+    # global stamp only covers the resolution window above (~0.3 s), so other
+    # sessions barely flash it
+    mv -f "$cstamp" "$QDIR/capturing-$target.stamp" 2>/dev/null
+    cstamp="$QDIR/capturing-$target.stamp"
+
     if [ "$running" = "0" ]; then
       # Idle: no queueing needed, just submit the draft as-is and leave.
       if [ -n "$text" ]; then
@@ -495,7 +597,6 @@ case "$cmd" in
     # user's next keystrokes cannot race the snapshot). Slow tail work (log,
     # insurance tick, closing our own tab) happens after focus is returned.
     if [ -n "$text" ]; then
-      "$CMUX_BIN" send --surface "$target" $'\x15' >/dev/null 2>&1
       # double-press guard: a second Opt+Enter can race the box clear and
       # scrape the same draft again (the TUI redraw lags the \x15 under
       # load). An identical line appended moments ago is that race, not an
@@ -506,8 +607,19 @@ case "$cmd" in
         log "capture surface=$target dropped double-press duplicate: $text"
         text=""
       else
-        printf '%s\n' "$text" >> "$QDIR/$target.queue"
+        # record first, clear second: killed between the two, the draft is
+        # both queued and still in the box — delivery treats box == line as
+        # clear-and-resend, so nothing is lost. The old clear-first order
+        # dropped the draft entirely if the append never ran.
+        if qlock_take "$target"; then
+          printf '%s\n' "$text" >> "$QDIR/$target.queue"
+          qlock_drop "$target"
+        else
+          # queue lock wedged: append unguarded — losing the draft is worse
+          printf '%s\n' "$text" >> "$QDIR/$target.queue"
+        fi
       fi
+      "$CMUX_BIN" send --surface "$target" $'\x15' >/dev/null 2>&1
     fi
     "$CMUX_BIN" rpc surface.focus "{\"surface_id\": \"$target\"}" >/dev/null 2>&1
     if [ -n "$text" ]; then
@@ -529,6 +641,11 @@ case "$cmd" in
     payload=$(cat)
     chain="$HOME/.config/cmux-claude-queue/statusline-chain"
     sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null)
+    surf=""
+    if [ -n "$sid" ]; then
+      surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
+        || surf=$(plutil -extract "sessions.claude-$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null)
+    fi
     if [ -f "$chain" ]; then
       # The chained statusline is the expensive part (user HUDs tend to run
       # git status and friends — seconds per run on a loaded machine), and
@@ -551,9 +668,20 @@ case "$cmd" in
         guard="$cache.bg"
         if [ -z "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ] \
            && [ -z "$(/usr/bin/find "$guard" -newermt '-30 seconds' 2>/dev/null)" ]; then
-          touch "$guard"  # one refresh in flight at a time; 30 s crash TTL
+          # the guard records the worker pid: a chain that hangs past the
+          # 30 s crash TTL is killed here, not accumulated one process per
+          # respawn. The comm check avoids killing an innocent process that
+          # recycled the pid.
+          oldbg=$(cat "$guard" 2>/dev/null)
+          if [ -n "$oldbg" ]; then
+            case "$(ps -o comm= -p "$oldbg" 2>/dev/null)" in
+              *bash|*sh) kill -9 "$oldbg" 2>/dev/null ;;
+            esac
+          fi
+          : > "$guard"  # one refresh in flight at a time; 30 s crash TTL
           (
             trap '' TERM HUP
+            echo "$BASHPID" > "$guard"
             out=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || out=""
             if [ -n "$out" ]; then printf '%s\n' "$out" > "$guard.$BASHPID"
             else : > "$guard.$BASHPID"; fi
@@ -565,9 +693,13 @@ case "$cmd" in
       fi
     fi
     # a capture is in flight (hotkey pressed, box not read/enqueued yet):
-    # show the queue row with a placeholder so feedback is one refresh away;
-    # the capture removes the marker on exit, the TTL guards against crashes
-    if [ -n "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-6 seconds' 2>/dev/null)" ]; then
+    # show the queue row with a placeholder so feedback is one refresh away.
+    # The global stamp exists only during target resolution (~0.3 s, short
+    # TTL so unrelated sessions barely flash it); after that the capture
+    # renames it per-surface and only the captured session's row shows it.
+    if [ -n "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-2 seconds' 2>/dev/null)" ] \
+       || { [ -n "$surf" ] \
+            && [ -n "$(/usr/bin/find "$QDIR/capturing-$surf.stamp" -newermt '-6 seconds' 2>/dev/null)" ]; }; then
       printf '\033[33m⏳ Queue:\033[0m \033[2m…\033[0m\n'
     fi
     # cheap out: no queue file with content anywhere -> skip the lookup
@@ -576,14 +708,9 @@ case "$cmd" in
       [ -s "$qf" ] && { pending=1; break; }
     done
     [ -z "$pending" ] && exit 0
-    # map this session to its surface with plutil (single-digit ms); a python
-    # only runs below, in the one session that actually owns a pending queue —
-    # not in every session that happens to refresh while some queue is waiting
-    surf=""
-    if [ -n "$sid" ]; then
-      surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
-        || surf=$(plutil -extract "sessions.claude-$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null)
-    fi
+    # a python only runs below, in the one session that actually owns a
+    # pending queue — not in every session that refreshes while some queue
+    # is waiting
     { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; } && exit 0
     out=$(python3 -c '
 import sys
@@ -638,6 +765,11 @@ print(json.dumps(d))' 2>/dev/null) || out=""
       *) printf '%s' "$payload" ;;
     esac
     exec >>"$QDIR/log.txt" 2>&1  # anything after this must not touch stdout
+    # housekeeping: surface ids regenerate on every cmux restart, so drained
+    # queues, old markers and stale stamps would otherwise accumulate forever
+    # (and slow the glob every statusline refresh pays)
+    /usr/bin/find "$QDIR" \( \( -name '*.queue' -size 0 \) -o -name '*.attempt' \
+      -o -name 'capturing-*.stamp' -o -name '*.qlock' \) -mtime +1 -delete 2>/dev/null
     shopt -s nullglob
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue
@@ -654,8 +786,16 @@ print(json.dumps(d))' 2>/dev/null) || out=""
   add)
     surface="${2:?usage: cmux-claude-queue add <surfaceId> <text>}"
     shift 2
-    printf '%s\n' "$*" >> "$QDIR/$surface.queue"
-    log "add surface=$surface queued: $*"
+    # queue format is one message per line: an embedded newline would split
+    # one prompt into several deliveries
+    text=$(printf '%s' "$*" | tr '\n' ' ')
+    if qlock_take "$surface"; then
+      printf '%s\n' "$text" >> "$QDIR/$surface.queue"
+      qlock_drop "$surface"
+    else
+      printf '%s\n' "$text" >> "$QDIR/$surface.queue"
+    fi
+    log "add surface=$surface queued: $text"
     [ "$(lifecycle "$surface")" != "running" ] && deliver_once "$surface"
     ;;
 
@@ -664,8 +804,14 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # keystrokes themselves (e.g. qq running as a deferred ! command)
     surface="${2:?usage: cmux-claude-queue enqueue <surfaceId> <text>}"
     shift 2
-    printf '%s\n' "$*" >> "$QDIR/$surface.queue"
-    log "enqueue surface=$surface queued: $*"
+    text=$(printf '%s' "$*" | tr '\n' ' ')
+    if qlock_take "$surface"; then
+      printf '%s\n' "$text" >> "$QDIR/$surface.queue"
+      qlock_drop "$surface"
+    else
+      printf '%s\n' "$text" >> "$QDIR/$surface.queue"
+    fi
+    log "enqueue surface=$surface queued: $text"
     ;;
 
   drain)
