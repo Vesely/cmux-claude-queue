@@ -130,7 +130,12 @@ PY
 }
 
 # Extract the input-box text from a read-screen dump: the region between the
-# last two full-width separator lines, minus the "❯ " prompt.
+# last two full-width separator lines, minus the "❯ " prompt. Wrapping is
+# reconstructed from row widths (hit live with a long URL): a row that runs
+# to the box edge is a hard visual wrap and continues WITHOUT a separator,
+# a short row ends with a real line break and joins with a single space.
+# Continuation rows drop their two-space indent — the old parser kept it and
+# joined every row with a space, splicing "   " into the middle of URLs.
 parse_input_box() {
   python3 -c '
 import re, sys
@@ -138,18 +143,29 @@ lines = sys.stdin.read().split("\n")
 seps = [i for i, l in enumerate(lines) if re.match(r"^\s*─{20,}\s*$", l)]
 if len(seps) < 2:
     sys.exit(0)
+width = len(lines[seps[-1]].rstrip())
 region = lines[seps[-2] + 1 : seps[-1]]
-text_parts = []
+pieces = []
 started = False
 for l in region:
+    full = len(l.rstrip()) >= width - 2
     if not started:
         m = re.match(r"^[❯>]\s?(.*)$", l)
         if m:
             started = True
-            text_parts.append(m.group(1).rstrip())
+            pieces.append((m.group(1).rstrip(), full))
     else:
-        text_parts.append(l.rstrip())
-print(" ".join(p for p in text_parts if p).strip())
+        t = l.rstrip()
+        if t.startswith("  "):
+            t = t[2:]
+        pieces.append((t, full))
+out = []
+for text, full in pieces:
+    if not text:
+        continue
+    out.append(text)
+    out.append("" if full else " ")
+print("".join(out).strip())
 '
 }
 
@@ -529,6 +545,31 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     "$box"*) : ;;
     *)
       log "deliver surface=$surface box diverged after typing, not submitting"
+      # retry cap: a line that keeps diverging (scrape imperfection on some
+      # exotic rendering) must not fight the user forever. After 3 attempts
+      # park it: the typed text stays visible in the box, the user just
+      # presses Enter, and a notification says so.
+      dfile="$QDIR/$surface.diverge"
+      dcount=1
+      if [ -f "$dfile" ] && [ "$(sed -n 2p "$dfile")" = "$line" ]; then
+        prev=$(sed -n 1p "$dfile")
+        case "$prev" in *[!0-9]*|'') prev=0 ;; esac
+        dcount=$((prev + 1))
+      fi
+      if [ "$dcount" -ge 3 ]; then
+        log "deliver surface=$surface parked after $dcount diverges, text left in box: $line"
+        if qlock_take "$surface"; then
+          tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
+          wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+          qlock_drop "$surface"
+        fi
+        rm -f "$dfile"
+        "$CMUX_BIN" notify --title "Queue" \
+          --body "Delivery parked: the text is in the input box, press Enter to send it" \
+          --surface "$surface" >/dev/null 2>&1
+      else
+        { printf '%s\n' "$dcount"; printf '%s\n' "$line"; } > "$dfile"
+      fi
       rm -rf "$lock"
       return 1 ;;
   esac
@@ -542,6 +583,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     # on any line, and a confirmed-but-not-popped line would be re-sent as a
     # duplicate prompt. With the record, the next tick takes the late-confirm
     # path above and pops without resending.
+    rm -f "$QDIR/$surface.diverge"
     { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
     if qlock_take "$surface"; then
       tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
@@ -802,7 +844,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # queues, old markers and stale stamps would otherwise accumulate forever
     # (and slow the glob every statusline refresh pays)
     /usr/bin/find "$QDIR" \( \( -name '*.queue' -size 0 \) -o -name '*.attempt' \
-      -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' \) -mtime +1 -delete 2>/dev/null
+      -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' -o -name '*.diverge' \) -mtime +1 -delete 2>/dev/null
     shopt -s nullglob
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue
