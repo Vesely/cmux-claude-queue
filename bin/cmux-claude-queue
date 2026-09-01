@@ -377,11 +377,18 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
 '; then rm -rf "$lock"; return 1; fi ;;
   esac
 
-  # A previous attempt may have submitted late: keystrokes sent while the TUI
-  # executes a deferred ! command buffer up and turn into a queued message that
-  # only submits a turn later. If a submit matching the line landed since that
-  # attempt, pop it without sending the keys again.
-  if [ -n "$sid" ] && [ -f "$afile" ] && [ "$(sed -n 2p "$afile")" = "$line" ] \
+  # A previous attempt may have already submitted this line: either a late
+  # submit (keystrokes sent while the TUI executes a deferred ! command buffer
+  # up and only submit a turn later), or a confirmed delivery whose queue pop
+  # was killed before it landed (cmux reaps hook processes when their
+  # notification clears — hit live: the kill fell between tail and mv and the
+  # line was re-sent 14 s later as a duplicate). If a submit matching the line
+  # landed since that attempt, pop it without sending the keys again. The
+  # marker is only honored while it is newer than the queue file: a LATER
+  # append means the head line is a fresh, intentional re-queue of the same
+  # text and must be sent normally, not swallowed by an old confirmation.
+  if [ -n "$sid" ] && [ -f "$afile" ] && [ "$afile" -nt "$qfile" ] \
+     && [ "$(sed -n 2p "$afile")" = "$line" ] \
      && confirm_submit "$sid" "$(sed -n 1p "$afile")" "$line" strict; then
     log "deliver surface=$surface late-confirmed, not resending: $line"
     tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
@@ -416,9 +423,14 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   done
 
   if [ -n "$delivered" ]; then
+    # Record the confirmed submit BEFORE popping: this process can be killed
+    # on any line, and a confirmed-but-not-popped line would be re-sent as a
+    # duplicate prompt. With the record, the next tick takes the late-confirm
+    # path above and pops without resending.
+    { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
+    tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
+      || log "deliver surface=$surface pop failed, next tick will late-confirm"
     log "deliver surface=$surface delivered: $line"
-    tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
-    rm -f "$afile"
     rm -rf "$lock"
     return 0
   fi
@@ -519,26 +531,38 @@ case "$cmd" in
     sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null)
     if [ -f "$chain" ]; then
       # The chained statusline is the expensive part (user HUDs tend to run
-      # git status and friends — seconds per run on a loaded machine), so its
-      # output is cached per session for 10 s. That lets settings.json use a
-      # short refreshInterval — the queue row shows up within ~2 s of a
-      # capture — while the user's own statusline runs LESS often than the
-      # usual 5 s cadence, not more. Branch/context info lagging up to 10 s
-      # is the deliberate trade.
+      # git status and friends — seconds per run on a loaded machine), and
+      # Claude Code kills a statusline command that is still running when the
+      # next refresh comes due (hit live: cold chain runs never finished, so
+      # the queue row and the delivery pump below silently stopped). The
+      # chain therefore NEVER runs in the foreground: the last output is
+      # served from a per-session cache immediately, and once the cache is
+      # older than 10 s a detached background job refreshes it for later
+      # runs. The wrapper stays fast no matter what the chain costs;
+      # branch/context info lagging ~10 s is the trade.
       cache=""
       [ -n "$sid" ] && cache="$QDIR/slcache-$sid"
-      if [ -n "$cache" ] && [ -s "$cache" ] \
-         && [ -n "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ]; then
-        base=$(cat "$cache")
-      else
+      if [ -z "$cache" ]; then
+        # no session id to key a cache by: degrade to a foreground run
         base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
-        if [ -n "$cache" ]; then
-          printf '%s\n' "$base" >"$cache.tmp.$$" 2>/dev/null \
-            && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null
-          /usr/bin/find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
+        [ -n "$base" ] && printf '%s\n' "$base"
+      else
+        [ -s "$cache" ] && cat "$cache"
+        guard="$cache.bg"
+        if [ -z "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ] \
+           && [ -z "$(/usr/bin/find "$guard" -newermt '-30 seconds' 2>/dev/null)" ]; then
+          touch "$guard"  # one refresh in flight at a time; 30 s crash TTL
+          (
+            trap '' TERM HUP
+            out=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || out=""
+            if [ -n "$out" ]; then printf '%s\n' "$out" > "$guard.$BASHPID"
+            else : > "$guard.$BASHPID"; fi
+            mv -f "$guard.$BASHPID" "$cache" 2>/dev/null
+            rm -f "$guard"
+            /usr/bin/find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
+          ) </dev/null >/dev/null 2>&1 &
         fi
       fi
-      [ -n "$base" ] && printf '%s\n' "$base"
     fi
     # a capture is in flight (hotkey pressed, box not read/enqueued yet):
     # show the queue row with a placeholder so feedback is one refresh away;
