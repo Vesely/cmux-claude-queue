@@ -1,0 +1,574 @@
+#!/bin/bash
+# cmux-claude-queue — true prompt queue for Claude Code running inside cmux.
+#
+# Unlike typing into a running Claude session (which steers the current turn),
+# this captures the message BEFORE it ever reaches Claude and delivers it as a
+# fresh prompt only after the session goes idle. The running turn never sees it.
+#
+# Architecture (three cooperating entry points):
+#
+#   capture     spawned by the cmux-claude-queue-hotkeyd daemon when the user
+#               presses Opt+Enter with cmux frontmost (or manually via the
+#               optional "queue-prompt" cmux Command Palette action). Scrapes
+#               the Claude input box off the terminal screen. Idle session:
+#               just submits the draft. Turn running: clears the box and
+#               appends the draft to the file queue; the pending queue shows
+#               up in the Claude Code statusline (`statusline` mode).
+#   statusline  Claude Code statusLine command (settings.json): runs the
+#               user's previous statusline command first (chain file), then
+#               appends one row with the pending queue for the session on
+#               stdin, when non-empty. Also acts as the delivery pump: an Esc
+#               interrupt produces no turn-complete notification, so the
+#               statusline refresh fires an invisible retry tick instead.
+#   notifyhook  registered in cmux.json notifications.hooks. cmux invokes it on
+#               every scheduled notification (agent turn complete etc.), passing
+#               the policy JSON on stdin. It echoes the JSON back unchanged, then
+#               tries to deliver one queued line for every surface with a
+#               non-empty queue. Turn-complete notifications are what normally
+#               flush the queue; any other notification acts as a retry tick.
+#
+# The cmux socket in its default "cmuxOnly" mode rejects clients that are not
+# cmux descendants, and the hotkey daemon is not one — the install therefore
+# requires automation.socketControlMode "password" in cmux.json (the cmux CLI
+# then auto-authenticates via the stored password).
+#
+# Modes:
+#   cmux-claude-queue capture              scrape + clear + enqueue + deliver-if-idle
+#   cmux-claude-queue statusline           Claude Code statusLine wrapper (JSON stdin)
+#   cmux-claude-queue notifyhook           cmux notification hook (JSON stdin/stdout)
+#   cmux-claude-queue add <surface> <text> enqueue text for a surface, deliver if idle
+#   cmux-claude-queue drain <surface>      blocking drain loop (manual/debug use)
+#
+# State: ~/.claude/prompt-queue/<surfaceId>.queue (one message per line)
+
+set -u
+
+QDIR="$HOME/.claude/prompt-queue"
+STORE="$HOME/.cmuxterm/claude-hook-sessions.json"
+EVENTS="$HOME/.cmuxterm/events.jsonl"
+CMUX_BIN="${CMUX_CLAUDE_HOOK_CMUX_BIN:-cmux}"
+# notification hooks run via /bin/sh with a minimal PATH; fall back to the bundle
+command -v "$CMUX_BIN" >/dev/null 2>&1 || CMUX_BIN="/Applications/cmux.app/Contents/Resources/bin/cmux"
+mkdir -p "$QDIR"
+
+# Socket auth: with automation.socketControlMode "password", cmux injects
+# CMUX_SOCKET_PASSWORD into terminals it spawns, but callers with older env
+# (running sessions, the hotkey daemon, detached shells) need it read from
+# cmux.json themselves.
+if [ -z "${CMUX_SOCKET_PASSWORD:-}" ] && [ -f "$HOME/.config/cmux/cmux.json" ]; then
+  CMUX_SOCKET_PASSWORD=$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("automation", {}).get("socketPassword") or "")
+except Exception:
+    pass' "$HOME/.config/cmux/cmux.json" 2>/dev/null)
+  [ -n "$CMUX_SOCKET_PASSWORD" ] && export CMUX_SOCKET_PASSWORD
+fi
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$QDIR/log.txt"; }
+
+# agentLifecycle of the session active on a surface: running | idle | needsInput | unknown
+# (store session ids appear both bare and "claude-"-prefixed across cmux versions)
+lifecycle() {
+  python3 - "$STORE" "$1" <<'PY' 2>/dev/null || echo unknown
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    sid = d.get("activeSessionsBySurface", {}).get(sys.argv[2], {}).get("sessionId") or ""
+    if sid.startswith("claude-"):
+        sid = sid[7:]
+    print(d.get("sessions", {}).get(sid, {}).get("agentLifecycle", "unknown"))
+except Exception:
+    print("unknown")
+PY
+}
+
+# bare sessionId (no "claude-" prefix) active on a surface
+session_of() {
+  python3 - "$STORE" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    sid = d.get("activeSessionsBySurface", {}).get(sys.argv[2], {}).get("sessionId") or ""
+    if sid.startswith("claude-"):
+        sid = sid[7:]
+    print(sid)
+except Exception:
+    pass
+PY
+}
+
+# surfaceId of the Claude session active in a workspace. Primary source is the
+# live surface.list rpc (resume_binding.kind == "claude") — the hook-session
+# store lags after a cmux restart until the session fires its next hook, which
+# is exactly when Cmd+Enter used to fail with "no claude session".
+target_surface() {
+  local t
+  t=$("$CMUX_BIN" rpc surface.list "{\"workspace_id\": \"$1\"}" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+best = None
+for s in d.get("surfaces", []):
+    rb = s.get("resume_binding") or {}
+    if rb.get("kind") == "claude" and s.get("id"):
+        t = rb.get("updated_at") or 0
+        if best is None or t > best[0]:
+            best = (t, s["id"])
+if best:
+    print(best[1])
+' 2>/dev/null)
+  if [ -n "$t" ]; then printf '%s\n' "$t"; return; fi
+  python3 - "$STORE" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    sid = d.get("activeSessionsByWorkspace", {}).get(sys.argv[2], {}).get("sessionId") or ""
+    if sid.startswith("claude-"):
+        sid = sid[7:]
+    print(d.get("sessions", {}).get(sid, {}).get("surfaceId", ""))
+except Exception:
+    pass
+PY
+}
+
+# Extract the input-box text from a read-screen dump: the region between the
+# last two full-width separator lines, minus the "❯ " prompt.
+parse_input_box() {
+  python3 -c '
+import re, sys
+lines = sys.stdin.read().split("\n")
+seps = [i for i, l in enumerate(lines) if re.match(r"^\s*─{20,}\s*$", l)]
+if len(seps) < 2:
+    sys.exit(0)
+region = lines[seps[-2] + 1 : seps[-1]]
+text_parts = []
+started = False
+for l in region:
+    if not started:
+        m = re.match(r"^[❯>]\s?(.*)$", l)
+        if m:
+            started = True
+            text_parts.append(m.group(1).rstrip())
+    else:
+        text_parts.append(l.rstrip())
+print(" ".join(p for p in text_parts if p).strip())
+'
+}
+
+read_box() { "$CMUX_BIN" read-screen --surface "$1" 2>/dev/null | parse_input_box; }
+
+# One-shot context read for capture, optimized for latency (a visible action
+# tab is waiting on it): store + events tail in a single python process, no
+# rpc round-trips. Prints "<target>|<sid>|<running 0/1>"; empty target means
+# the store has no session for this workspace (caller falls back to rpc).
+resolve_ctx() {
+  python3 - "$STORE" "$1" "$EVENTS" <<'PY' 2>/dev/null
+import json, sys
+store, ws, events = sys.argv[1:4]
+target = sid = ""
+running = 0
+try:
+    d = json.load(open(store))
+    s0 = d.get("activeSessionsByWorkspace", {}).get(ws, {}).get("sessionId") or ""
+    if s0.startswith("claude-"):
+        s0 = s0[7:]
+    sess = d.get("sessions", {}).get(s0, {})
+    if sess.get("surfaceId"):
+        target, sid = sess["surfaceId"], s0
+        if sess.get("agentLifecycle") == "running":
+            running = 1
+except Exception:
+    pass
+if sid and not running:
+    # the store lags right after a submit; cross-check fresh hook events
+    try:
+        f = open(events, "rb")
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 2097152))
+        needle = ("claude-" + sid).encode()
+        last = b""
+        for line in f.read().splitlines():
+            if needle in line and (b"agent.hook.UserPromptSubmit" in line
+                                   or b'"agent.hook.Stop"' in line):
+                last = line
+        if b"UserPromptSubmit" in last:
+            running = 1
+    except Exception:
+        pass
+print(f"{target}|{sid}|{running}")
+PY
+}
+
+# The store's agentLifecycle lags a few seconds behind a prompt submit; the
+# hook events in events.jsonl are fresh. Running = the session's newest
+# UserPromptSubmit is younger than its newest Stop.
+events_running() {
+  local last
+  last=$(tail -c 2097152 "$EVENTS" 2>/dev/null | grep -F "claude-$1" \
+    | grep -E '"agent\.hook\.(UserPromptSubmit|Stop)"' | tail -n 1)
+  case "$last" in *UserPromptSubmit*) return 0 ;; esac
+  return 1
+}
+
+# Is the session's turn actually in flight? Hook events are the primary truth
+# (newest UserPromptSubmit vs Stop), BUT an Esc interrupt emits NO Stop hook,
+# no sidebar update and no notification (verified in events.jsonl)
+# — both the store and the events stay "running" forever. So a hook-based
+# running verdict older than 90 s is re-checked against the live TUI screen:
+# the spinner status line ("✳ … (2m 17s · ↓ 7.8k tokens…)", early form
+# "(3s · esc to interrupt)") only exists while a turn streams or runs tools.
+session_running() {
+  local surface="$1" sid="$2" verdict
+  verdict=$(python3 - "$EVENTS" "$sid" <<'PY' 2>/dev/null
+import datetime, json, sys
+events, sid = sys.argv[1], "claude-" + sys.argv[2]
+last = None
+try:
+    f = open(events, "rb")
+    f.seek(0, 2)
+    f.seek(max(0, f.tell() - 2097152))
+    for line in f.read().splitlines():
+        if sid.encode() not in line:
+            continue
+        if b"agent.hook.UserPromptSubmit" not in line and b'"agent.hook.Stop"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("name") in ("agent.hook.UserPromptSubmit", "agent.hook.Stop") \
+           and (d.get("payload") or {}).get("session_id") == sid:
+            last = d
+except Exception:
+    pass
+if last is None:
+    print("unknown")
+elif last["name"] == "agent.hook.Stop":
+    print("idle")
+else:
+    try:
+        ts = datetime.datetime.fromisoformat((last.get("occurred_at") or "").replace("Z", "+00:00"))
+        age = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
+    except Exception:
+        age = 0
+    print("running" if age < 90 else "stale")
+PY
+)
+  case "$verdict" in
+    idle) return 1 ;;
+    running) return 0 ;;
+    stale)
+      # hooks say running but nothing landed for 90+ s: either a long
+      # tool-less streaming stretch (still running) or an Esc interrupt
+      # (idle). Only the TUI spinner line tells them apart.
+      if "$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null | python3 -c '
+import re, sys
+sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·", sys.stdin.read()) else 1)
+'; then return 0; fi
+      return 1 ;;
+    *) [ "$(lifecycle "$surface")" = "running" ] && return 0 || return 1 ;;
+  esac
+}
+
+# Did a UserPromptSubmit for this session land in events.jsonl after byte
+# offset $2? With $4 = strict, additionally require tool_input_length to match
+# the queued line (the payload redacts the prompt text but keeps the length of
+# its {"prompt": ...} JSON), so a foreign submit does not count.
+confirm_submit() {
+  local sid="$1" offset="$2" line="$3" strict="${4:-loose}"
+  tail -c "+$((offset + 1))" "$EVENTS" 2>/dev/null | python3 -c '
+import json, sys
+sid, text, strict = sys.argv[1], sys.argv[2], sys.argv[3] == "strict"
+# cmux serializes tool_input compactly: {"prompt":"..."} with no spaces
+lens = {len(json.dumps({"prompt": text}, separators=(",", ":"))),
+        len(json.dumps({"prompt": text}, separators=(",", ":"), ensure_ascii=False))}
+for raw in sys.stdin:
+    if "UserPromptSubmit" not in raw or sid not in raw:
+        continue
+    try:
+        d = json.loads(raw)
+    except Exception:
+        continue
+    if d.get("name") != "agent.hook.UserPromptSubmit":
+        continue
+    p = d.get("payload") or {}
+    if p.get("session_id") != sid:
+        continue
+    if strict and p.get("tool_input_length") not in lens:
+        continue
+    sys.exit(0)
+sys.exit(1)' "claude-$sid" "$line" "$strict"
+}
+
+# Try to deliver the first queued line for a surface. Lock-guarded so capture,
+# the notification hook and a manual drain never double-deliver. Returns 0 when
+# the line was confirmed delivered, 1 otherwise (line stays queued for the next
+# trigger). Keystroke injection can fail or be silently dropped (e.g. while the
+# user interacts with the app), so a submission only counts once a matching
+# UserPromptSubmit shows up in events.jsonl.
+deliver_once() {
+  local surface="$1"
+  local qfile="$QDIR/$surface.queue"
+  local lock="$QDIR/$surface.lock"
+  local afile="$QDIR/$surface.attempt"
+  local line box sid offset delivered oldpid
+
+  line=$(head -n 1 "$qfile" 2>/dev/null || true)
+  [ -z "$line" ] && return 0
+
+  if ! mkdir "$lock" 2>/dev/null; then
+    oldpid=$(cat "$lock/pid" 2>/dev/null || true)
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      return 1  # someone else is delivering right now
+    fi
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || return 1
+  fi
+  echo $$ > "$lock/pid"
+  # no RETURN trap here: it would fire on every nested function return; a stale
+  # lock after a crash is recovered by the pid-liveness check above
+
+  sid=$(session_of "$surface")
+  if [ -z "$sid" ]; then
+    # without a session id we can neither check running-state nor confirm a
+    # submit — sending keys blind risks steering; wait for a later tick
+    log "deliver surface=$surface no session registered yet, waiting"
+    rm -rf "$lock"; return 1
+  fi
+  if session_running "$surface" "$sid"; then rm -rf "$lock"; return 1; fi
+
+  # A previous attempt may have submitted late: keystrokes sent while the TUI
+  # executes a deferred ! command buffer up and turn into a queued message that
+  # only submits a turn later. If a submit matching the line landed since that
+  # attempt, pop it without sending the keys again.
+  if [ -n "$sid" ] && [ -f "$afile" ] && [ "$(sed -n 2p "$afile")" = "$line" ] \
+     && confirm_submit "$sid" "$(sed -n 1p "$afile")" "$line" strict; then
+    log "deliver surface=$surface late-confirmed, not resending: $line"
+    tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
+    rm -f "$afile"
+    rm -rf "$lock"
+    return 0
+  fi
+
+  # never clobber a draft the user is typing
+  box=$(read_box "$surface")
+  if [ -n "$box" ] && [ "$box" != "$line" ]; then
+    log "deliver surface=$surface holding off, user draft in box"
+    rm -rf "$lock"
+    return 1
+  fi
+
+  offset=$(wc -c < "$EVENTS" 2>/dev/null || echo 0)
+  "$CMUX_BIN" send --surface "$surface" $'\x15' >>"$QDIR/log.txt" 2>&1 \
+    || log "deliver surface=$surface send clear rc=$?"
+  "$CMUX_BIN" send --surface "$surface" "$line" >>"$QDIR/log.txt" 2>&1 \
+    || log "deliver surface=$surface send text rc=$?"
+  sleep 0.5
+  "$CMUX_BIN" send-key --surface "$surface" enter >>"$QDIR/log.txt" 2>&1 \
+    || log "deliver surface=$surface send enter rc=$?"
+  delivered=""
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 0.5
+    if [ -n "$sid" ] && confirm_submit "$sid" "$offset" "$line"; then
+      delivered=yes
+      break
+    fi
+  done
+
+  if [ -n "$delivered" ]; then
+    log "deliver surface=$surface delivered: $line"
+    tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
+    rm -f "$afile"
+    rm -rf "$lock"
+    return 0
+  fi
+  log "deliver surface=$surface not confirmed, keeping queued: $line"
+  { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
+  rm -rf "$lock"
+  return 1
+}
+
+cmd="${1:-capture}"
+
+case "$cmd" in
+  capture)
+    ws="${CMUX_WORKSPACE_ID:-}"
+    if [ -z "$ws" ]; then
+      # invoked outside a cmux terminal (hotkey daemon): target the workspace
+      # selected in the focused cmux window
+      ws=$("$CMUX_BIN" rpc workspace.current '{}' 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("workspace", {}).get("id") or "")
+except Exception:
+    pass' 2>/dev/null)
+    fi
+    [ -z "$ws" ] && { log "capture: no workspace (not inside cmux, rpc failed)"; exit 1; }
+    ctx=$(resolve_ctx "$ws")
+    target=${ctx%%|*}; rest=${ctx#*|}; sid=${rest%%|*}; running=${rest##*|}
+    if [ -z "$target" ]; then
+      # store miss (e.g. right after a cmux restart): slow rpc fallback
+      target=$(target_surface "$ws")
+      sid=$(session_of "$target")
+      running=0
+      if [ "$(lifecycle "$target")" = "running" ] || { [ -n "$sid" ] && events_running "$sid"; }; then
+        running=1
+      fi
+    fi
+    if [ -z "$target" ]; then
+      "$CMUX_BIN" notify --title "Queue" --body "No Claude session found in this workspace" --workspace "$ws" >/dev/null 2>&1
+      log "capture ws=$ws: no claude session"
+      [ -n "${CMUX_SURFACE_ID:-}" ] && "$CMUX_BIN" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1
+      exit 0
+    fi
+
+    if [ "$running" = "0" ]; then
+      # Idle: no queueing needed, just submit the draft as-is and leave.
+      dump=$("$CMUX_BIN" read-screen --surface "$target" 2>/dev/null)
+      text=$(printf '%s' "$dump" | parse_input_box)
+      if [ -n "$text" ]; then
+        "$CMUX_BIN" rpc surface.focus "{\"surface_id\": \"$target\"}" >/dev/null 2>&1
+        "$CMUX_BIN" send-key --surface "$target" enter >/dev/null 2>&1
+        log "capture surface=$target idle, submitted draft: $text"
+      fi
+      [ -n "${CMUX_SURFACE_ID:-}" ] && "$CMUX_BIN" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1
+      exit 0
+    fi
+
+    # Turn in flight: clear the box, enqueue the draft, and hand focus back
+    # to the Claude input as early as possible (right after the clear, so the
+    # user's next keystrokes cannot race the snapshot). Slow tail work (log,
+    # insurance tick, closing our own tab) happens after focus is returned.
+    dump=$("$CMUX_BIN" read-screen --surface "$target" 2>/dev/null)
+    text=$(printf '%s' "$dump" | parse_input_box)
+    if [ -n "$text" ]; then
+      "$CMUX_BIN" send --surface "$target" $'\x15' >/dev/null 2>&1
+      printf '%s\n' "$text" >> "$QDIR/$target.queue"
+    fi
+    "$CMUX_BIN" rpc surface.focus "{\"surface_id\": \"$target\"}" >/dev/null 2>&1
+    if [ -n "$text" ]; then
+      log "capture surface=$target queued: $text"
+      # insurance tick: if the turn actually just ended (stale running state),
+      # the hook delivers right away; while truly running it no-ops
+      "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$target" >/dev/null 2>&1
+    fi
+    [ -n "${CMUX_SURFACE_ID:-}" ] && "$CMUX_BIN" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1
+    exit 0
+    ;;
+
+  statusline)
+    # Claude Code statusLine command: if the user had their own statusline
+    # command before installing, it lives in the chain file (a shell script
+    # that gets the statusline JSON on stdin); run it first and print its
+    # output untouched, then append one row with this session's pending queue.
+    # Empty queue = no extra row, the statusline shrinks back automatically.
+    payload=$(cat)
+    chain="$HOME/.config/cmux-claude-queue/statusline-chain"
+    if [ -f "$chain" ]; then
+      base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
+      [ -n "$base" ] && printf '%s\n' "$base"
+    fi
+    # cheap out: no queue file with content anywhere -> skip the lookup
+    pending=""
+    for qf in "$QDIR"/*.queue; do
+      [ -s "$qf" ] && { pending=1; break; }
+    done
+    [ -z "$pending" ] && exit 0
+    out=$(printf '%s' "$payload" | python3 -c '
+import json, os, sys
+store_p, qdir = sys.argv[1], sys.argv[2]
+try:
+    sid = json.load(sys.stdin).get("session_id") or ""
+    sess = json.load(open(store_p)).get("sessions", {})
+    surf = (sess.get(sid) or sess.get("claude-" + sid) or {}).get("surfaceId") or ""
+    with open(os.path.join(qdir, surf + ".queue")) as f:
+        items = [l.strip() for l in f if l.strip()]
+    if not items:
+        raise SystemExit
+    DIM, YEL, RST = "\033[2m", "\033[33m", "\033[0m"
+    nxt = items[0][:70] + ("…" if len(items[0]) > 70 else "")
+    more = f" {DIM}+{len(items) - 1} more{RST}" if len(items) > 1 else ""
+    print(surf + "\x1f" + f"{YEL}⏳ queued:{RST} {nxt}{more}")
+except Exception:
+    pass' "$STORE" "$QDIR" 2>/dev/null)
+    [ -z "$out" ] && exit 0
+    surf=${out%%$'\x1f'*}
+    printf '%s\n' "${out#*$'\x1f'}"
+    # delivery pump: an Esc interrupt kills a turn WITHOUT any Stop hook or
+    # turn-complete notification, so a queued prompt would otherwise wait for
+    # an unrelated notification. The statusline re-runs on refreshInterval;
+    # while this session's queue is non-empty, fire the invisible retry tick
+    # at most every 15 s — the notifyhook does the actual careful delivery.
+    stamp="$QDIR/tick.stamp"
+    if [ -z "$(find "$stamp" -newermt '-15 seconds' 2>/dev/null)" ]; then
+      touch "$stamp"
+      "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$surf" >/dev/null 2>&1
+    fi
+    exit 0
+    ;;
+
+  notifyhook)
+    # cmux notification hook: echo the policy JSON back unchanged, then use the
+    # notification as a delivery tick for every surface with a pending queue.
+    payload=$(cat)
+    # our own retry ticks (fired by qq / failed deliveries) must stay invisible:
+    # disable every boolean effect before echoing the policy back
+    out=$(printf '%s' "$payload" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("notification", {}).get("title") == "cmux-claude-queue-tick":
+    eff = d.get("effects") or {}
+    for k, v in list(eff.items()):
+        if isinstance(v, bool):
+            eff[k] = False
+    d["effects"] = eff
+print(json.dumps(d))' 2>/dev/null) || out=""
+    if [ -n "$out" ]; then printf '%s' "$out"; else printf '%s' "$payload"; fi
+    exec >>"$QDIR/log.txt" 2>&1  # anything after this must not touch stdout
+    shopt -s nullglob
+    for qf in "$QDIR"/*.queue; do
+      [ -s "$qf" ] || continue
+      # at most one real keystroke delivery per tick, to stay inside the hook
+      # timeout; skipped surfaces get the next notification. Cheap skips
+      # (running / locked / user draft) return fast and let the loop continue.
+      began=$SECONDS
+      deliver_once "$(basename "$qf" .queue)" && break
+      [ $((SECONDS - began)) -ge 2 ] && break
+    done
+    exit 0
+    ;;
+
+  add)
+    surface="${2:?usage: cmux-claude-queue add <surfaceId> <text>}"
+    shift 2
+    printf '%s\n' "$*" >> "$QDIR/$surface.queue"
+    log "add surface=$surface queued: $*"
+    [ "$(lifecycle "$surface")" != "running" ] && deliver_once "$surface"
+    ;;
+
+  enqueue)
+    # append only, no delivery attempt — for callers that must never inject
+    # keystrokes themselves (e.g. qq running as a deferred ! command)
+    surface="${2:?usage: cmux-claude-queue enqueue <surfaceId> <text>}"
+    shift 2
+    printf '%s\n' "$*" >> "$QDIR/$surface.queue"
+    log "enqueue surface=$surface queued: $*"
+    ;;
+
+  drain)
+    surface="${2:?usage: cmux-claude-queue drain <surfaceId>}"
+    end=$((SECONDS + 14400))
+    while [ "$SECONDS" -lt "$end" ]; do
+      [ -s "$QDIR/$surface.queue" ] || break
+      deliver_once "$surface" || sleep 3
+    done
+    ;;
+
+  *)
+    echo "usage: cmux-claude-queue [capture|statusline|notifyhook|add <surface> <text>|drain <surface>]"
+    exit 1
+    ;;
+esac
