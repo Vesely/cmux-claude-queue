@@ -19,6 +19,10 @@ let targetBundleIDs: Set<String> = [
     // "com.mitchellh.ghostty",  // future: needs a Ghostty capture backend first
 ]
 let captureScript = ("~/.local/bin/cmux-claude-queue" as NSString).expandingTildeInPath
+// Instant audible ack: the capture itself takes up to ~1 s on a loaded machine
+// (three serial cmux socket calls), during which nothing visible happens yet.
+// Touch this file to disable the sound.
+let soundOptOutPath = ("~/.config/cmux-claude-queue/no-sound" as NSString).expandingTildeInPath
 
 final class HotkeyDaemon {
     private var hotKeyRef: EventHotKeyRef?
@@ -64,6 +68,11 @@ final class HotkeyDaemon {
         let now = DispatchTime.now()
         guard now.uptimeNanoseconds - lastFire.uptimeNanoseconds > 300_000_000 else { return }
         lastFire = now
+        if !FileManager.default.fileExists(atPath: soundOptOutPath) {
+            let sound = NSSound(named: "Pop")
+            sound?.volume = 0.5
+            sound?.play()
+        }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: captureScript)
         p.arguments = ["capture"]

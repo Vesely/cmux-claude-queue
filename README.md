@@ -35,7 +35,7 @@ hotkeyd ──spawns──▶ capture ──Ctrl+U──▶ input box cleared
                             removing it from the queue
 ```
 
-- **`hotkeyd/main.swift`** — a ~70-line daemon. Registers Opt+Return as a system hotkey via Carbon `RegisterEventHotKey` *only while cmux is the frontmost app* (no Accessibility permission needed) and spawns `cmux-claude-queue capture`. In every other app Opt+Enter behaves normally.
+- **`hotkeyd/main.swift`** — a ~80-line daemon. Registers Opt+Return as a system hotkey via Carbon `RegisterEventHotKey` *only while cmux is the frontmost app* (no Accessibility permission needed) and spawns `cmux-claude-queue capture`. In every other app Opt+Enter behaves normally. It plays a quiet "Pop" the instant the hotkey fires — the capture itself takes up to a second on a busy machine, and the sound confirms the press was heard before anything visible happens (`touch ~/.config/cmux-claude-queue/no-sound` to disable).
 - **`capture`** — finds the Claude session in the focused cmux workspace, scrapes the draft from the terminal screen (`cmux read-screen`), clears the box, appends the draft to a per-surface queue file. Idle session: just presses Enter instead.
 - **`statusline`** — a Claude Code `statusLine` wrapper. Chains your previous statusline command (if any), appends the queue row, and doubles as a delivery pump: pressing Esc kills a turn without emitting any event, so the periodic statusline refresh fires an invisible retry notification while the queue is non-empty.
 - **`notifyhook`** — a cmux notification hook. On every notification (turn complete, or a retry tick) it checks per session whether the turn is really over, types the queued text into the input box and presses Enter, then waits for the matching `UserPromptSubmit` event in cmux's event log before removing the item from the queue. It backs off if you have a new draft in the box, and never injects into a running turn.
@@ -59,9 +59,9 @@ cd cmux-claude-queue
 The installer symlinks `bin/cmux-claude-queue` into `~/.local/bin`, builds the daemon, and loads the `com.cmux-claude-queue.hotkeyd` LaunchAgent. It then prints the two config snippets you need to add yourself:
 
 1. **`~/.config/cmux/cmux.json`** — set `automation.socketControlMode` to `"password"` with a generated `automation.socketPassword` (the hotkey daemon is not a cmux child process, and cmux's default `cmuxOnly` socket mode rejects it; the cmux CLI auto-authenticates using the stored password), and register `cmux-claude-queue notifyhook` under `notifications.hooks`. Run `cmux reload-config` afterwards.
-2. **`~/.claude/settings.json`** — point `statusLine.command` at `cmux-claude-queue statusline` with `refreshInterval: 5`.
+2. **`~/.claude/settings.json`** — point `statusLine.command` at `cmux-claude-queue statusline` with `refreshInterval: 2`.
 
-If you already had a `statusLine` command, save it as a small shell script at `~/.config/cmux-claude-queue/statusline-chain` (it receives the statusline JSON on stdin); its output stays on top and the queue row is appended below.
+If you already had a `statusLine` command, save it as a small shell script at `~/.config/cmux-claude-queue/statusline-chain` (it receives the statusline JSON on stdin); its output stays on top and the queue row is appended below. The chain's output is cached per session for 10 s, so the short refresh interval makes the queue row show up fast without making your own statusline run more often — with the default 2 s interval it actually runs *less* often than the usual 5 s cadence.
 
 ## Extras
 
@@ -74,6 +74,7 @@ The tool is built to be invisible on a busy machine — everything is event-driv
 
 - The hotkey daemon sits at 0% CPU (Carbon hotkey + app-activation callbacks, no event tap, no timers) and ~30 MB RSS.
 - The statusline wrapper adds about 10 ms of pure bash on top of whatever your own chained statusline costs; an interpreter is spawned only in the one session that owns a non-empty queue (other sessions get a plutil lookup in single-digit milliseconds).
+- The chained statusline is cached per session for 10 s, so the 2 s refresh interval only re-runs the cheap wrapper. With many sessions open this makes the tool *reduce* total statusline load compared to a plain 5 s cadence, while the queue row still appears within ~2 s of a capture.
 - The capture hot path (hotkey → box cleared) spawns exactly one Python process — session lookup, event-log check, screen scrape and box parse all happen inside it — plus two cmux socket calls. Interpreter startup dominates this path on a loaded machine, which is why it is one process instead of four.
 - The notification hook answers cmux with a pure-bash passthrough for every foreign notification, so it never delays your notifications; JSON rewriting runs only for the tool's own invisible retry ticks.
 - Delivery attempts are triggered by turn-complete notifications and by the statusline retry tick (rate-limited to one per 15 s, and only while a queue is non-empty). With empty queues the tool does no periodic work at all.

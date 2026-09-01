@@ -494,8 +494,28 @@ case "$cmd" in
     # Empty queue = no extra row, the statusline shrinks back automatically.
     payload=$(cat)
     chain="$HOME/.config/cmux-claude-queue/statusline-chain"
+    sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null)
     if [ -f "$chain" ]; then
-      base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
+      # The chained statusline is the expensive part (user HUDs tend to run
+      # git status and friends — seconds per run on a loaded machine), so its
+      # output is cached per session for 10 s. That lets settings.json use a
+      # short refreshInterval — the queue row shows up within ~2 s of a
+      # capture — while the user's own statusline runs LESS often than the
+      # usual 5 s cadence, not more. Branch/context info lagging up to 10 s
+      # is the deliberate trade.
+      cache=""
+      [ -n "$sid" ] && cache="$QDIR/slcache-$sid"
+      if [ -n "$cache" ] && [ -s "$cache" ] \
+         && [ -n "$(find "$cache" -newermt '-10 seconds' 2>/dev/null)" ]; then
+        base=$(cat "$cache")
+      else
+        base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
+        if [ -n "$cache" ]; then
+          printf '%s\n' "$base" >"$cache.tmp.$$" 2>/dev/null \
+            && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null
+          find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
+        fi
+      fi
       [ -n "$base" ] && printf '%s\n' "$base"
     fi
     # cheap out: no queue file with content anywhere -> skip the lookup
@@ -507,7 +527,6 @@ case "$cmd" in
     # map this session to its surface with plutil (single-digit ms); a python
     # only runs below, in the one session that actually owns a pending queue —
     # not in every session that happens to refresh while some queue is waiting
-    sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null)
     surf=""
     if [ -n "$sid" ]; then
       surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
