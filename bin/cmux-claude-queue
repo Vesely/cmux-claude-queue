@@ -297,12 +297,15 @@ PY
 # Did a UserPromptSubmit for this session land in events.jsonl after byte
 # offset $2? With $4 = strict, additionally require tool_input_length to match
 # the queued line (the payload redacts the prompt text but keeps the length of
-# its {"prompt": ...} JSON), so a foreign submit does not count.
+# its {"prompt": ...} JSON), so a foreign submit does not count. With $4 =
+# near, allow the submit to be up to 4 bytes LONGER than the queued line: the
+# box scrape strips trailing whitespace, so a copy of the same draft submitted
+# by the TUI itself can come out slightly longer than what was scraped.
 confirm_submit() {
   local sid="$1" offset="$2" line="$3" strict="${4:-loose}"
   tail -c "+$((offset + 1))" "$EVENTS" 2>/dev/null | python3 -c '
 import json, sys
-sid, text, strict = sys.argv[1], sys.argv[2], sys.argv[3] == "strict"
+sid, text, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 # cmux serializes tool_input compactly: {"prompt":"..."} with no spaces
 lens = {len(json.dumps({"prompt": text}, separators=(",", ":"))),
         len(json.dumps({"prompt": text}, separators=(",", ":"), ensure_ascii=False))}
@@ -318,7 +321,11 @@ for raw in sys.stdin:
     p = d.get("payload") or {}
     if p.get("session_id") != sid:
         continue
-    if strict and p.get("tool_input_length") not in lens:
+    til = p.get("tool_input_length")
+    if mode == "strict" and til not in lens:
+        continue
+    if mode == "near" and not (isinstance(til, int)
+                               and any(n <= til <= n + 4 for n in lens)):
         continue
     sys.exit(0)
 sys.exit(1)' "claude-$sid" "$line" "$strict"
@@ -433,25 +440,6 @@ deliver_once() {
     log "deliver surface=$surface no session registered yet, waiting"
     rm -rf "$lock"; return 1
   fi
-  case "$verdict" in
-    running) rm -rf "$lock"; return 1 ;;
-    stale)
-      # hooks say running but nothing landed for 90+ s: either a long
-      # tool-less streaming stretch (still running) or an Esc interrupt
-      # (idle). Only the TUI live-status line tells them apart — it exists
-      # while a turn streams or runs tools, in several shapes:
-      #   "✳ Verb… (2m 17s · ↓ 7.8k tokens · thought for 6s)"  main spinner
-      #   "(3s · esc to interrupt)"                             early form
-      #   "◯ general-purpose  Doing X … 6m 57s · ↓ 110.0k tokens"  subagent,
-      #                                            NO parentheses (hit live)
-      # also refuse on a pending tool-permission dialog: it renders with no
-      # spinner or timer, and an Enter sent into it would answer the dialog
-      if "$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null | python3 -c '
-import re, sys
-sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]|Do you want to|don.t ask again", sys.stdin.read()) else 1)
-'; then rm -rf "$lock"; return 1; fi ;;
-  esac
-
   # A previous attempt may have already submitted this line: either a late
   # submit (keystrokes sent while the TUI executes a deferred ! command buffer
   # up and only submit a turn later), or a confirmed delivery whose queue pop
@@ -469,11 +457,48 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     if qlock_take "$surface"; then
       tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
         && rm -f "$afile"
+      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
     rm -rf "$lock"
     return 0
   fi
+
+  # The queued text may have already been submitted WITHOUT us (hit live):
+  # a plain Enter racing the Opt+Enter puts the draft into Claude Code's own
+  # native queued-messages buffer, which auto-submits it at turn end — our
+  # scraped copy would then go out a second time. If a near-matching submit
+  # landed since this queue became non-empty, pop instead of resending.
+  qoff=$(cat "$QDIR/$surface.qoffset" 2>/dev/null)
+  if [ -n "$qoff" ] && confirm_submit "$sid" "$qoff" "$line" near; then
+    log "deliver surface=$surface already submitted since enqueue, popping without resend: $line"
+    if qlock_take "$surface"; then
+      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
+      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+      qlock_drop "$surface"
+    fi
+    rm -rf "$lock"
+    return 0
+  fi
+
+  case "$verdict" in
+    running) rm -rf "$lock"; return 1 ;;
+    stale)
+      # hooks say running but nothing landed for 30+ s: either a long
+      # tool-less streaming stretch (still running) or an Esc interrupt
+      # (idle). Only the TUI live-status line tells them apart — it exists
+      # while a turn streams or runs tools, in several shapes:
+      #   "✳ Verb… (2m 17s · ↓ 7.8k tokens · thought for 6s)"  main spinner
+      #   "(3s · esc to interrupt)"                             early form
+      #   "◯ general-purpose  Doing X … 6m 57s · ↓ 110.0k tokens"  subagent,
+      #                                            NO parentheses (hit live)
+      # also refuse on a pending tool-permission dialog: it renders with no
+      # spinner or timer, and an Enter sent into it would answer the dialog
+      if "$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null | python3 -c '
+import re, sys
+sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]|Do you want to|don.t ask again", sys.stdin.read()) else 1)
+'; then rm -rf "$lock"; return 1; fi ;;
+  esac
 
   # never clobber a draft the user is typing
   box=$(read_box "$surface")
@@ -521,6 +546,9 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     if qlock_take "$surface"; then
       tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
         || log "deliver surface=$surface pop failed, next tick will late-confirm"
+      # advance the enqueue offset past our own submit, so an identical line
+      # queued next (intentional repeat) is not swallowed as already-sent
+      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     else
       log "deliver surface=$surface pop skipped (queue busy), next tick will late-confirm"
@@ -612,6 +640,11 @@ case "$cmd" in
         # clear-and-resend, so nothing is lost. The old clear-first order
         # dropped the draft entirely if the append never ran.
         if qlock_take "$target"; then
+          # first line into an empty queue: remember where the event log
+          # stood, so delivery can tell "this text was already submitted
+          # after it was queued" apart from any older identical submit
+          [ -s "$QDIR/$target.queue" ] \
+            || wc -c < "$EVENTS" > "$QDIR/$target.qoffset" 2>/dev/null
           printf '%s\n' "$text" >> "$QDIR/$target.queue"
           qlock_drop "$target"
         else
@@ -769,7 +802,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # queues, old markers and stale stamps would otherwise accumulate forever
     # (and slow the glob every statusline refresh pays)
     /usr/bin/find "$QDIR" \( \( -name '*.queue' -size 0 \) -o -name '*.attempt' \
-      -o -name 'capturing-*.stamp' -o -name '*.qlock' \) -mtime +1 -delete 2>/dev/null
+      -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' \) -mtime +1 -delete 2>/dev/null
     shopt -s nullglob
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue
@@ -790,6 +823,8 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # one prompt into several deliveries
     text=$(printf '%s' "$*" | tr '\n' ' ')
     if qlock_take "$surface"; then
+      [ -s "$QDIR/$surface.queue" ] \
+        || wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       printf '%s\n' "$text" >> "$QDIR/$surface.queue"
       qlock_drop "$surface"
     else
@@ -806,6 +841,8 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     shift 2
     text=$(printf '%s' "$*" | tr '\n' ' ')
     if qlock_take "$surface"; then
+      [ -s "$QDIR/$surface.queue" ] \
+        || wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       printf '%s\n' "$text" >> "$QDIR/$surface.queue"
       qlock_drop "$surface"
     else
