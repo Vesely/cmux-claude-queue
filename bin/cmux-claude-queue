@@ -504,26 +504,31 @@ case "$cmd" in
       [ -s "$qf" ] && { pending=1; break; }
     done
     [ -z "$pending" ] && exit 0
-    out=$(printf '%s' "$payload" | python3 -c '
-import json, os, sys
-store_p, qdir = sys.argv[1], sys.argv[2]
+    # map this session to its surface with plutil (single-digit ms); a python
+    # only runs below, in the one session that actually owns a pending queue —
+    # not in every session that happens to refresh while some queue is waiting
+    sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null)
+    surf=""
+    if [ -n "$sid" ]; then
+      surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
+        || surf=$(plutil -extract "sessions.claude-$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null)
+    fi
+    { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; } && exit 0
+    out=$(python3 -c '
+import sys
 try:
-    sid = json.load(sys.stdin).get("session_id") or ""
-    sess = json.load(open(store_p)).get("sessions", {})
-    surf = (sess.get(sid) or sess.get("claude-" + sid) or {}).get("surfaceId") or ""
-    with open(os.path.join(qdir, surf + ".queue")) as f:
+    with open(sys.argv[1]) as f:
         items = [l.strip() for l in f if l.strip()]
     if not items:
         raise SystemExit
     DIM, YEL, RST = "\033[2m", "\033[33m", "\033[0m"
     nxt = items[0][:70] + ("…" if len(items[0]) > 70 else "")
     more = f" {DIM}+{len(items) - 1} more{RST}" if len(items) > 1 else ""
-    print(surf + "\x1f" + f"{YEL}⏳ queued:{RST} {nxt}{more}")
+    print(f"{YEL}⏳ queued:{RST} {nxt}{more}")
 except Exception:
-    pass' "$STORE" "$QDIR" 2>/dev/null)
+    pass' "$QDIR/$surf.queue" 2>/dev/null)
     [ -z "$out" ] && exit 0
-    surf=${out%%$'\x1f'*}
-    printf '%s\n' "${out#*$'\x1f'}"
+    printf '%s\n' "$out"
     # delivery pump: an Esc interrupt kills a turn WITHOUT any Stop hook or
     # turn-complete notification, so a queued prompt would otherwise wait for
     # an unrelated notification. The statusline re-runs on refreshInterval;
