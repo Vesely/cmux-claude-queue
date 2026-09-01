@@ -51,19 +51,10 @@ CMUX_BIN="${CMUX_CLAUDE_HOOK_CMUX_BIN:-cmux}"
 command -v "$CMUX_BIN" >/dev/null 2>&1 || CMUX_BIN="/Applications/cmux.app/Contents/Resources/bin/cmux"
 mkdir -p "$QDIR"
 
-# Socket auth: with automation.socketControlMode "password", cmux injects
-# CMUX_SOCKET_PASSWORD into terminals it spawns, but callers with older env
-# (running sessions, the hotkey daemon, detached shells) need it read from
-# cmux.json themselves.
-if [ -z "${CMUX_SOCKET_PASSWORD:-}" ] && [ -f "$HOME/.config/cmux/cmux.json" ]; then
-  CMUX_SOCKET_PASSWORD=$(python3 -c '
-import json, sys
-try:
-    print(json.load(open(sys.argv[1])).get("automation", {}).get("socketPassword") or "")
-except Exception:
-    pass' "$HOME/.config/cmux/cmux.json" 2>/dev/null)
-  [ -n "$CMUX_SOCKET_PASSWORD" ] && export CMUX_SOCKET_PASSWORD
-fi
+# Socket auth: no password handling here on purpose. The cmux CLI resolves it
+# itself (--password, then CMUX_SOCKET_PASSWORD, then the password store cmux
+# maintains from cmux.json), so even callers with no cmux env at all — the
+# hotkey daemon, detached shells — authenticate without us spawning anything.
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$QDIR/log.txt"; }
 
@@ -160,15 +151,17 @@ print(" ".join(p for p in text_parts if p).strip())
 
 read_box() { "$CMUX_BIN" read-screen --surface "$1" 2>/dev/null | parse_input_box; }
 
-# One-shot context read for capture, optimized for latency (a visible action
-# tab is waiting on it): store + events tail in a single python process, no
-# rpc round-trips. Prints "<target>|<sid>|<running 0/1>"; empty target means
-# the store has no session for this workspace (caller falls back to rpc).
-resolve_ctx() {
-  python3 - "$STORE" "$1" "$EVENTS" <<'PY' 2>/dev/null
-import json, sys
-store, ws, events = sys.argv[1:4]
-target = sid = ""
+# One-shot context read for capture, optimized for latency (the user just hit
+# the hotkey and is waiting for the box to clear): store + events tail +
+# read-screen + input-box parse, all in a SINGLE python process — interpreter
+# startup dominates this path on a loaded machine, so one process, not four.
+# Prints "<target>\x1f<sid>\x1f<running 0/1>\x1f<draft text>"; empty target
+# means the store has no session for this workspace (caller falls back to rpc).
+capture_ctx() {
+  python3 - "$STORE" "$1" "$EVENTS" "$CMUX_BIN" <<'PY' 2>/dev/null
+import json, re, subprocess, sys
+store, ws, events, cmux = sys.argv[1:5]
+target = sid = text = ""
 running = 0
 try:
     d = json.load(open(store))
@@ -198,7 +191,29 @@ if sid and not running:
             running = 1
     except Exception:
         pass
-print(f"{target}|{sid}|{running}")
+if target:
+    # scrape the draft off the input box: the region between the last two
+    # full-width separator lines, minus the "❯ " prompt (same rules as
+    # parse_input_box, inlined here to stay inside the one process)
+    try:
+        dump = subprocess.run([cmux, "read-screen", "--surface", target],
+                              capture_output=True, text=True, timeout=5).stdout
+        lines = dump.split("\n")
+        seps = [i for i, l in enumerate(lines) if re.match(r"^\s*─{20,}\s*$", l)]
+        if len(seps) >= 2:
+            parts, started = [], False
+            for l in lines[seps[-2] + 1 : seps[-1]]:
+                if not started:
+                    m = re.match(r"^[❯>]\s?(.*)$", l)
+                    if m:
+                        started = True
+                        parts.append(m.group(1).rstrip())
+                else:
+                    parts.append(l.rstrip())
+        text = " ".join(p for p in parts if p).strip() if len(seps) >= 2 else ""
+    except Exception:
+        pass
+print(f"{target}\x1f{sid}\x1f{running}\x1f{text}")
 PY
 }
 
@@ -213,64 +228,65 @@ events_running() {
   return 1
 }
 
-# Is the session's turn actually in flight? Hook events are the primary truth
-# (newest UserPromptSubmit vs Stop), BUT an Esc interrupt emits NO Stop hook,
-# no sidebar update and no notification (verified in events.jsonl)
-# — both the store and the events stay "running" forever. So a hook-based
-# running verdict older than 90 s is re-checked against the live TUI screen:
-# the spinner status line ("✳ … (2m 17s · ↓ 7.8k tokens…)", early form
-# "(3s · esc to interrupt)") only exists while a turn streams or runs tools.
-session_running() {
-  local surface="$1" sid="$2" verdict
-  verdict=$(python3 - "$EVENTS" "$sid" <<'PY' 2>/dev/null
+# Session id + turn verdict for a surface, in ONE python process (this runs on
+# every delivery tick, and interpreter startup dominates on a loaded machine).
+# Hook events are the primary truth (newest UserPromptSubmit vs Stop), BUT an
+# Esc interrupt emits NO Stop hook, no sidebar update and no notification
+# (verified in events.jsonl) — both the store and the events stay
+# "running" forever. A hook-based running verdict older than 90 s is therefore
+# reported as "stale" and the caller re-checks the live TUI screen. With no
+# usable events the store's agentLifecycle decides.
+# Prints "<sid>\x1f<idle|running|stale>".
+session_state() {
+  python3 - "$STORE" "$1" "$EVENTS" <<'PY' 2>/dev/null
 import datetime, json, sys
-events, sid = sys.argv[1], "claude-" + sys.argv[2]
-last = None
+store, surface, events = sys.argv[1:4]
+sid = ""
+lifecycle = "unknown"
 try:
-    f = open(events, "rb")
-    f.seek(0, 2)
-    f.seek(max(0, f.tell() - 2097152))
-    for line in f.read().splitlines():
-        if sid.encode() not in line:
-            continue
-        if b"agent.hook.UserPromptSubmit" not in line and b'"agent.hook.Stop"' not in line:
-            continue
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        if d.get("name") in ("agent.hook.UserPromptSubmit", "agent.hook.Stop") \
-           and (d.get("payload") or {}).get("session_id") == sid:
-            last = d
+    d = json.load(open(store))
+    sid = d.get("activeSessionsBySurface", {}).get(surface, {}).get("sessionId") or ""
+    if sid.startswith("claude-"):
+        sid = sid[7:]
+    lifecycle = d.get("sessions", {}).get(sid, {}).get("agentLifecycle", "unknown")
 except Exception:
     pass
-if last is None:
-    print("unknown")
-elif last["name"] == "agent.hook.Stop":
-    print("idle")
-else:
+verdict = "unknown"
+if sid:
+    needle = ("claude-" + sid).encode()
+    last = None
     try:
-        ts = datetime.datetime.fromisoformat((last.get("occurred_at") or "").replace("Z", "+00:00"))
-        age = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
+        f = open(events, "rb")
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 2097152))
+        for line in f.read().splitlines():
+            if needle not in line:
+                continue
+            if b"agent.hook.UserPromptSubmit" not in line and b'"agent.hook.Stop"' not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("name") in ("agent.hook.UserPromptSubmit", "agent.hook.Stop") \
+               and (e.get("payload") or {}).get("session_id") == needle.decode():
+                last = e
     except Exception:
-        age = 0
-    print("running" if age < 90 else "stale")
+        pass
+    if last is not None:
+        if last["name"] == "agent.hook.Stop":
+            verdict = "idle"
+        else:
+            try:
+                ts = datetime.datetime.fromisoformat((last.get("occurred_at") or "").replace("Z", "+00:00"))
+                age = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
+            except Exception:
+                age = 0
+            verdict = "running" if age < 90 else "stale"
+if verdict == "unknown":
+    verdict = "running" if lifecycle == "running" else "idle"
+print(sid + "\x1f" + verdict)
 PY
-)
-  case "$verdict" in
-    idle) return 1 ;;
-    running) return 0 ;;
-    stale)
-      # hooks say running but nothing landed for 90+ s: either a long
-      # tool-less streaming stretch (still running) or an Esc interrupt
-      # (idle). Only the TUI spinner line tells them apart.
-      if "$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null | python3 -c '
-import re, sys
-sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·", sys.stdin.read()) else 1)
-'; then return 0; fi
-      return 1 ;;
-    *) [ "$(lifecycle "$surface")" = "running" ] && return 0 || return 1 ;;
-  esac
 }
 
 # Did a UserPromptSubmit for this session land in events.jsonl after byte
@@ -314,7 +330,7 @@ deliver_once() {
   local qfile="$QDIR/$surface.queue"
   local lock="$QDIR/$surface.lock"
   local afile="$QDIR/$surface.attempt"
-  local line box sid offset delivered oldpid
+  local line box sid ctx verdict offset delivered oldpid
 
   line=$(head -n 1 "$qfile" 2>/dev/null || true)
   [ -z "$line" ] && return 0
@@ -331,14 +347,31 @@ deliver_once() {
   # no RETURN trap here: it would fire on every nested function return; a stale
   # lock after a crash is recovered by the pid-liveness check above
 
-  sid=$(session_of "$surface")
+  ctx=$(session_state "$surface")
+  sid=${ctx%%$'\x1f'*}
+  verdict=${ctx#*$'\x1f'}
   if [ -z "$sid" ]; then
     # without a session id we can neither check running-state nor confirm a
     # submit — sending keys blind risks steering; wait for a later tick
     log "deliver surface=$surface no session registered yet, waiting"
     rm -rf "$lock"; return 1
   fi
-  if session_running "$surface" "$sid"; then rm -rf "$lock"; return 1; fi
+  case "$verdict" in
+    running) rm -rf "$lock"; return 1 ;;
+    stale)
+      # hooks say running but nothing landed for 90+ s: either a long
+      # tool-less streaming stretch (still running) or an Esc interrupt
+      # (idle). Only the TUI live-status line tells them apart — it exists
+      # while a turn streams or runs tools, in several shapes:
+      #   "✳ Verb… (2m 17s · ↓ 7.8k tokens · thought for 6s)"  main spinner
+      #   "(3s · esc to interrupt)"                             early form
+      #   "◯ general-purpose  Doing X … 6m 57s · ↓ 110.0k tokens"  subagent,
+      #                                            NO parentheses (hit live)
+      if "$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null | python3 -c '
+import re, sys
+sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]", sys.stdin.read()) else 1)
+'; then rm -rf "$lock"; return 1; fi ;;
+  esac
 
   # A previous attempt may have submitted late: keystrokes sent while the TUI
   # executes a deferred ! command buffer up and turn into a queued message that
@@ -398,17 +431,14 @@ case "$cmd" in
     ws="${CMUX_WORKSPACE_ID:-}"
     if [ -z "$ws" ]; then
       # invoked outside a cmux terminal (hotkey daemon): target the workspace
-      # selected in the focused cmux window
-      ws=$("$CMUX_BIN" rpc workspace.current '{}' 2>/dev/null | python3 -c '
-import json, sys
-try:
-    print(json.load(sys.stdin).get("workspace", {}).get("id") or "")
-except Exception:
-    pass' 2>/dev/null)
+      # selected in the focused cmux window. plutil is a real JSON parser and
+      # starts in single-digit milliseconds, unlike a python interpreter.
+      ws=$("$CMUX_BIN" rpc workspace.current '{}' 2>/dev/null \
+        | plutil -extract workspace.id raw -o - -- - 2>/dev/null)
     fi
     [ -z "$ws" ] && { log "capture: no workspace (not inside cmux, rpc failed)"; exit 1; }
-    ctx=$(resolve_ctx "$ws")
-    target=${ctx%%|*}; rest=${ctx#*|}; sid=${rest%%|*}; running=${rest##*|}
+    ctx=$(capture_ctx "$ws")
+    IFS=$'\x1f' read -r target sid running text <<< "$ctx"
     if [ -z "$target" ]; then
       # store miss (e.g. right after a cmux restart): slow rpc fallback
       target=$(target_surface "$ws")
@@ -417,6 +447,7 @@ except Exception:
       if [ "$(lifecycle "$target")" = "running" ] || { [ -n "$sid" ] && events_running "$sid"; }; then
         running=1
       fi
+      text=$(read_box "$target")
     fi
     if [ -z "$target" ]; then
       "$CMUX_BIN" notify --title "Queue" --body "No Claude session found in this workspace" --workspace "$ws" >/dev/null 2>&1
@@ -427,8 +458,6 @@ except Exception:
 
     if [ "$running" = "0" ]; then
       # Idle: no queueing needed, just submit the draft as-is and leave.
-      dump=$("$CMUX_BIN" read-screen --surface "$target" 2>/dev/null)
-      text=$(printf '%s' "$dump" | parse_input_box)
       if [ -n "$text" ]; then
         "$CMUX_BIN" rpc surface.focus "{\"surface_id\": \"$target\"}" >/dev/null 2>&1
         "$CMUX_BIN" send-key --surface "$target" enter >/dev/null 2>&1
@@ -442,8 +471,6 @@ except Exception:
     # to the Claude input as early as possible (right after the clear, so the
     # user's next keystrokes cannot race the snapshot). Slow tail work (log,
     # insurance tick, closing our own tab) happens after focus is returned.
-    dump=$("$CMUX_BIN" read-screen --surface "$target" 2>/dev/null)
-    text=$(printf '%s' "$dump" | parse_input_box)
     if [ -n "$text" ]; then
       "$CMUX_BIN" send --surface "$target" $'\x15' >/dev/null 2>&1
       printf '%s\n' "$text" >> "$QDIR/$target.queue"
@@ -513,10 +540,14 @@ except Exception:
   notifyhook)
     # cmux notification hook: echo the policy JSON back unchanged, then use the
     # notification as a delivery tick for every surface with a pending queue.
+    # cmux blocks the notification until it has our answer, so the echo must be
+    # instant: only our own retry ticks need the python rewrite (they must stay
+    # invisible — every boolean effect off); anything else passes straight
+    # through on a bash substring check alone.
     payload=$(cat)
-    # our own retry ticks (fired by qq / failed deliveries) must stay invisible:
-    # disable every boolean effect before echoing the policy back
-    out=$(printf '%s' "$payload" | python3 -c '
+    case "$payload" in
+      *cmux-claude-queue-tick*)
+        out=$(printf '%s' "$payload" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 if d.get("notification", {}).get("title") == "cmux-claude-queue-tick":
@@ -526,7 +557,10 @@ if d.get("notification", {}).get("title") == "cmux-claude-queue-tick":
             eff[k] = False
     d["effects"] = eff
 print(json.dumps(d))' 2>/dev/null) || out=""
-    if [ -n "$out" ]; then printf '%s' "$out"; else printf '%s' "$payload"; fi
+        if [ -n "$out" ]; then printf '%s' "$out"; else printf '%s' "$payload"; fi
+        ;;
+      *) printf '%s' "$payload" ;;
+    esac
     exec >>"$QDIR/log.txt" 2>&1  # anything after this must not touch stdout
     shopt -s nullglob
     for qf in "$QDIR"/*.queue; do

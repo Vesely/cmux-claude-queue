@@ -22,6 +22,8 @@ let captureScript = ("~/.local/bin/cmux-claude-queue" as NSString).expandingTild
 
 final class HotkeyDaemon {
     private var hotKeyRef: EventHotKeyRef?
+    private var lastFire = DispatchTime(uptimeNanoseconds: 0)
+    private var children = Set<Process>()
 
     func start() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
@@ -57,13 +59,22 @@ final class HotkeyDaemon {
         // belt and braces: registration should already scope us to the targets
         guard let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
               targetBundleIDs.contains(front) else { return }
+        // debounce a double-tap: two captures racing would read the same
+        // screen and enqueue the draft twice
+        let now = DispatchTime.now()
+        guard now.uptimeNanoseconds - lastFire.uptimeNanoseconds > 300_000_000 else { return }
+        lastFire = now
         let p = Process()
         p.executableURL = URL(fileURLWithPath: captureScript)
         p.arguments = ["capture"]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         p.environment = env
-        try? p.run()
+        // hold a reference until exit so the child is reliably reaped
+        p.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async { self?.children.remove(proc) }
+        }
+        do { try p.run(); children.insert(p) } catch {}
     }
 }
 
