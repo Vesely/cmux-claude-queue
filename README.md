@@ -6,8 +6,8 @@ Claude Code has no native message queue: anything you type while a turn is runni
 
 `cmux-claude-queue` fixes that at the terminal level. Type your next prompt into the Claude Code input box as usual and press **Opt+Enter**:
 
-- the draft disappears from the input box before Claude ever sees it,
-- it shows up in the Claude Code statusline as `⏳ queued: …`,
+- a quiet "Pop" confirms the press instantly, and the statusline shows `⏳ Queue: …` on its next refresh,
+- the draft disappears from the input box before Claude ever sees it and fills in the queue row,
 - and the moment the current turn ends it is submitted as a fresh, ordinary prompt.
 
 No new tab, no focus change, no steering. If the session is idle, Opt+Enter simply submits the draft like a plain Enter. Multiple queued prompts are delivered in FIFO order.
@@ -24,7 +24,7 @@ hotkeyd ──spawns──▶ capture ──Ctrl+U──▶ input box cleared
  (Carbon hotkey,       │
   cmux frontmost       └──▶ ~/.claude/prompt-queue/<surfaceId>.queue
   only)                            │
-                                   ├──▶ statusline row "⏳ queued: …"
+                                   ├──▶ statusline row "⏳ Queue: …"
                                    │       (+ retry tick while non-empty)
                                    ▼
                             notifyhook (cmux notification hook)
@@ -36,7 +36,7 @@ hotkeyd ──spawns──▶ capture ──Ctrl+U──▶ input box cleared
 ```
 
 - **`hotkeyd/main.swift`** — a ~80-line daemon. Registers Opt+Return as a system hotkey via Carbon `RegisterEventHotKey` *only while cmux is the frontmost app* (no Accessibility permission needed) and spawns `cmux-claude-queue capture`. In every other app Opt+Enter behaves normally. It plays a quiet "Pop" the instant the hotkey fires — the capture itself takes up to a second on a busy machine, and the sound confirms the press was heard before anything visible happens (`touch ~/.config/cmux-claude-queue/no-sound` to disable).
-- **`capture`** — finds the Claude session in the focused cmux workspace, scrapes the draft from the terminal screen (`cmux read-screen`), clears the box, appends the draft to a per-surface queue file. Idle session: just presses Enter instead.
+- **`capture`** — finds the Claude session in the focused cmux workspace, scrapes the draft from the terminal screen (`cmux read-screen`), clears the box, appends the draft to a per-surface queue file. Idle session: just presses Enter instead. A marker file set on entry makes the statusline show a transient `⏳ Queue: …` placeholder while the capture is still working, so visible feedback is one refresh (~2 s) away even before the box clears.
 - **`statusline`** — a Claude Code `statusLine` wrapper. Chains your previous statusline command (if any), appends the queue row, and doubles as a delivery pump: pressing Esc kills a turn without emitting any event, so the periodic statusline refresh fires an invisible retry notification while the queue is non-empty.
 - **`notifyhook`** — a cmux notification hook. On every notification (turn complete, or a retry tick) it checks per session whether the turn is really over, types the queued text into the input box and presses Enter, then waits for the matching `UserPromptSubmit` event in cmux's event log before removing the item from the queue. It backs off if you have a new draft in the box, and never injects into a running turn.
 
@@ -84,6 +84,7 @@ The tool is built to be invisible on a busy machine — everything is event-driv
 - A queued prompt is only submitted when the session is idle; the running turn never sees it. Turn state is decided from cmux's Claude hook events, with an on-screen spinner check as the tiebreaker (covers Esc-interrupted turns, which emit no event at all).
 - Delivery is confirmed against cmux's event log (session id + exact prompt length) before the item leaves the queue; unconfirmed sends are retried, and a late-arriving submit is detected instead of re-sent (no duplicates).
 - If you start typing a new draft while something is queued, delivery backs off until the box is free — your draft is never overwritten.
+- A nervous double Opt+Enter cannot enqueue the draft twice: the second capture can race the box clear and scrape the same text again, so an identical line captured within 3 s is dropped. Deliberately re-queueing the same prompt later still works.
 
 ## Limitations
 

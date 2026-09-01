@@ -51,6 +51,10 @@ CMUX_BIN="${CMUX_CLAUDE_HOOK_CMUX_BIN:-cmux}"
 command -v "$CMUX_BIN" >/dev/null 2>&1 || CMUX_BIN="/Applications/cmux.app/Contents/Resources/bin/cmux"
 mkdir -p "$QDIR"
 
+# Every mtime age check below pins /usr/bin/find: the -newermt '-N seconds'
+# relative form is what macOS find parses, while common PATH replacements
+# (bfs, GNU findutils) reject or reinterpret it — silently, inside $().
+
 # Socket auth: no password handling here on purpose. The cmux CLI resolves it
 # itself (--password, then CMUX_SOCKET_PASSWORD, then the password store cmux
 # maintains from cmux.json), so even callers with no cmux env at all — the
@@ -428,6 +432,13 @@ cmd="${1:-capture}"
 
 case "$cmd" in
   capture)
+    # Instant statusline feedback: mark a capture in flight before any of the
+    # slow socket work. While this file is fresh the statusline shows a
+    # transient "⏳ Queue: …" row, which turns into the real queued row once
+    # the draft lands in a queue file. Removed on every exit path (trap),
+    # with a short mtime TTL in the statusline as the crash guard.
+    touch "$QDIR/capturing.stamp"
+    trap 'rm -f "$QDIR/capturing.stamp"' EXIT
     ws="${CMUX_WORKSPACE_ID:-}"
     if [ -z "$ws" ]; then
       # invoked outside a cmux terminal (hotkey daemon): target the workspace
@@ -473,7 +484,18 @@ case "$cmd" in
     # insurance tick, closing our own tab) happens after focus is returned.
     if [ -n "$text" ]; then
       "$CMUX_BIN" send --surface "$target" $'\x15' >/dev/null 2>&1
-      printf '%s\n' "$text" >> "$QDIR/$target.queue"
+      # double-press guard: a second Opt+Enter can race the box clear and
+      # scrape the same draft again (the TUI redraw lags the \x15 under
+      # load). An identical line appended moments ago is that race, not an
+      # intentional repeat — drop it. Deliberate re-queues arrive later.
+      if [ -s "$QDIR/$target.queue" ] \
+         && [ "$(tail -n 1 "$QDIR/$target.queue")" = "$text" ] \
+         && [ -n "$(/usr/bin/find "$QDIR/$target.queue" -newermt '-3 seconds' 2>/dev/null)" ]; then
+        log "capture surface=$target dropped double-press duplicate: $text"
+        text=""
+      else
+        printf '%s\n' "$text" >> "$QDIR/$target.queue"
+      fi
     fi
     "$CMUX_BIN" rpc surface.focus "{\"surface_id\": \"$target\"}" >/dev/null 2>&1
     if [ -n "$text" ]; then
@@ -506,17 +528,23 @@ case "$cmd" in
       cache=""
       [ -n "$sid" ] && cache="$QDIR/slcache-$sid"
       if [ -n "$cache" ] && [ -s "$cache" ] \
-         && [ -n "$(find "$cache" -newermt '-10 seconds' 2>/dev/null)" ]; then
+         && [ -n "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ]; then
         base=$(cat "$cache")
       else
         base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
         if [ -n "$cache" ]; then
           printf '%s\n' "$base" >"$cache.tmp.$$" 2>/dev/null \
             && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null
-          find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
+          /usr/bin/find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
         fi
       fi
       [ -n "$base" ] && printf '%s\n' "$base"
+    fi
+    # a capture is in flight (hotkey pressed, box not read/enqueued yet):
+    # show the queue row with a placeholder so feedback is one refresh away;
+    # the capture removes the marker on exit, the TTL guards against crashes
+    if [ -n "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-6 seconds' 2>/dev/null)" ]; then
+      printf '\033[33m⏳ Queue:\033[0m \033[2m…\033[0m\n'
     fi
     # cheap out: no queue file with content anywhere -> skip the lookup
     pending=""
@@ -543,7 +571,7 @@ try:
     DIM, YEL, RST = "\033[2m", "\033[33m", "\033[0m"
     nxt = items[0][:70] + ("…" if len(items[0]) > 70 else "")
     more = f" {DIM}+{len(items) - 1} more{RST}" if len(items) > 1 else ""
-    print(f"{YEL}⏳ queued:{RST} {nxt}{more}")
+    print(f"{YEL}⏳ Queue:{RST} {nxt}{more}")
 except Exception:
     pass' "$QDIR/$surf.queue" 2>/dev/null)
     [ -z "$out" ] && exit 0
@@ -554,7 +582,7 @@ except Exception:
     # while this session's queue is non-empty, fire the invisible retry tick
     # at most every 15 s — the notifyhook does the actual careful delivery.
     stamp="$QDIR/tick.stamp"
-    if [ -z "$(find "$stamp" -newermt '-15 seconds' 2>/dev/null)" ]; then
+    if [ -z "$(/usr/bin/find "$stamp" -newermt '-15 seconds' 2>/dev/null)" ]; then
       touch "$stamp"
       "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$surf" >/dev/null 2>&1
     fi
