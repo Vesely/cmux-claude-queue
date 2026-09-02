@@ -448,7 +448,7 @@ deliver_once() {
   local qfile="$QDIR/$surface.queue"
   local lock="$QDIR/$surface.lock"
   local afile="$QDIR/$surface.attempt"
-  local line box sid ctx verdict offset delivered oldpid
+  local line box sid ctx verdict offset delivered oldpid is_slash probe
 
   [ -s "$qfile" ] || return 0
 
@@ -474,6 +474,18 @@ deliver_once() {
   line=$(head -n 1 "$qfile" 2>/dev/null || true)
   [ -z "$line" ] && { rm -rf "$lock"; return 0; }
 
+  # Slash commands (/compact, /clear, skill invocations...) are handled inside
+  # the Claude Code TUI and emit no UserPromptSubmit event, so the event-log
+  # confirm can never succeed for them — the pump would resubmit the command
+  # every tick forever (hit live: /compact resent 14x). They are confirmed by
+  # box state instead, below. A first token with a second slash or a character
+  # commands never contain is a path or plain text, not a command.
+  is_slash=""
+  case "${line%% *}" in
+    /*/*|/*[!A-Za-z0-9:_-]*) : ;;
+    /?*) is_slash=1 ;;
+  esac
+
   ctx=$(session_state "$surface")
   sid=${ctx%%$'\x1f'*}
   verdict=${ctx#*$'\x1f'}
@@ -493,9 +505,12 @@ deliver_once() {
   # marker is only honored while it is newer than the queue file: a LATER
   # append means the head line is a fresh, intentional re-queue of the same
   # text and must be sent normally, not swallowed by an old confirmation.
+  # For a slash command the record alone is trusted — no event will ever
+  # exist, and the record is only written after the box-cleared confirmation.
   if [ -n "$sid" ] && [ -f "$afile" ] && [ "$afile" -nt "$qfile" ] \
      && [ "$(sed -n 2p "$afile")" = "$line" ] \
-     && confirm_submit "$sid" "$(sed -n 1p "$afile")" "$line" strict; then
+     && { [ -n "$is_slash" ] \
+          || confirm_submit "$sid" "$(sed -n 1p "$afile")" "$line" strict; }; then
     log "deliver surface=$surface late-confirmed, not resending: $line"
     if qlock_take "$surface"; then
       tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
@@ -546,9 +561,26 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   # never clobber a draft the user is typing
   box=$(read_box "$surface")
   if [ -n "$box" ] && [ "$box" != "$line" ]; then
-    log "deliver surface=$surface holding off, user draft in box"
-    rm -rf "$lock"
-    return 1
+    # Claude Code's ghost-text prompt suggestion scrapes exactly like a typed
+    # draft (same ❯ prefix; no style attribute survives read-screen) and
+    # would hold delivery off forever (hit live). Ghost text is display-only
+    # over an EMPTY buffer: after typing one char the box holds just that
+    # char, while a real draft holds draft+char. The backspace undoes the
+    # probe in both cases (a suggestion simply re-renders on an empty box).
+    # Only reached when the session is idle, so the probe cannot steer a
+    # running turn.
+    probe=""
+    if "$CMUX_BIN" send --surface "$surface" "x" >>"$QDIR/log.txt" 2>&1; then
+      sleep 0.3
+      probe=$(read_box "$surface")
+      "$CMUX_BIN" send-key --surface "$surface" backspace >>"$QDIR/log.txt" 2>&1
+    fi
+    if [ "$probe" != "x" ]; then
+      log "deliver surface=$surface holding off, user draft in box"
+      rm -rf "$lock"
+      return 1
+    fi
+    log "deliver surface=$surface box content is a ghost suggestion, proceeding"
   fi
 
   offset=$(wc -c < "$EVENTS" 2>/dev/null || echo 0)
@@ -603,14 +635,28 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   "$CMUX_BIN" send-key --surface "$surface" enter >>"$QDIR/log.txt" 2>&1 \
     || log "deliver surface=$surface send enter rc=$?"
   delivered=""
-  if confirm_wait "$sid" "$offset" "$line"; then delivered=yes; fi
+  if [ -n "$is_slash" ]; then
+    # No event will ever confirm a slash command; confirm by box state: the
+    # TUI clears the input box the moment Enter takes the command. The full
+    # line (or a rendering prefix of it) still sitting there means Enter has
+    # not landed; an empty or unrelated box means the TUI took it.
+    for _ in 1 2 3; do
+      sleep 1
+      box=$(read_box "$surface")
+      [ -z "$box" ] && { delivered=yes; break; }
+      case "$line" in
+        "$box"*) : ;;
+        *) delivered=yes; break ;;
+      esac
+    done
+  elif confirm_wait "$sid" "$offset" "$line"; then delivered=yes; fi
 
   if [ -n "$delivered" ]; then
     # Record the confirmed submit BEFORE popping: this process can be killed
     # on any line, and a confirmed-but-not-popped line would be re-sent as a
     # duplicate prompt. With the record, the next tick takes the late-confirm
     # path above and pops without resending.
-    rm -f "$QDIR/$surface.diverge"
+    rm -f "$QDIR/$surface.diverge" "$QDIR/$surface.resend"
     { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
     if qlock_take "$surface"; then
       tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
@@ -627,7 +673,38 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     return 0
   fi
   log "deliver surface=$surface not confirmed, keeping queued: $line"
-  { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
+  # the attempt record backs the late-confirm path, which for slash commands
+  # trusts the record without an event — so for them it may only ever be
+  # written by the confirmed branch above, never on a failed attempt
+  if [ -z "$is_slash" ]; then
+    { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
+  fi
+  # Resend cap: a line that can never be confirmed must not be resubmitted
+  # forever (the /compact loop was exactly that, before slash detection).
+  # Each strike here means the text was fully typed, verified in the box and
+  # Entered — after three of those, a fourth send is guaranteed spam: drop
+  # the line (it stays in the log) and tell the user.
+  rfile="$QDIR/$surface.resend"
+  rcount=1
+  if [ -f "$rfile" ] && [ "$(sed -n 2p "$rfile")" = "$line" ]; then
+    rprev=$(sed -n 1p "$rfile")
+    case "$rprev" in *[!0-9]*|'') rprev=0 ;; esac
+    rcount=$((rprev + 1))
+  fi
+  if [ "$rcount" -ge 3 ]; then
+    log "deliver surface=$surface dropped after $rcount unconfirmed sends: $line"
+    if qlock_take "$surface"; then
+      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
+        && rm -f "$rfile"
+      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+      qlock_drop "$surface"
+    fi
+    "$CMUX_BIN" notify --title "Queue" \
+      --body "Prompt sent 3x without confirmation, removed from the queue (text is in the log)" \
+      --surface "$surface" >/dev/null 2>&1
+  else
+    { printf '%s\n' "$rcount"; printf '%s\n' "$line"; } > "$rfile"
+  fi
   rm -rf "$lock"
   return 1
 }
@@ -876,7 +953,8 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # queues, old markers and stale stamps would otherwise accumulate forever
     # (and slow the glob every statusline refresh pays)
     /usr/bin/find "$QDIR" \( \( -name '*.queue' -size 0 \) -o -name '*.attempt' \
-      -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' -o -name '*.diverge' \) -mtime +1 -delete 2>/dev/null
+      -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' \
+      -o -name '*.diverge' -o -name '*.resend' \) -mtime +1 -delete 2>/dev/null
     shopt -s nullglob
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue

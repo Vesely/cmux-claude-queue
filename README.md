@@ -84,9 +84,9 @@ The tool is built to be invisible on a busy machine — everything is event-driv
 ## Safety properties
 
 - A queued prompt is only submitted when the session is idle; the running turn never sees it. Turn state is decided from cmux's Claude hook events, with an on-screen spinner check as the tiebreaker (covers Esc-interrupted turns, which emit no event at all).
-- Delivery is confirmed against cmux's event log (session id + exact prompt length) before the item leaves the queue; unconfirmed sends are retried, and a late-arriving submit is detected instead of re-sent (no duplicates).
+- Delivery is confirmed against cmux's event log (session id + exact prompt length) before the item leaves the queue; unconfirmed sends are retried, and a late-arriving submit is detected instead of re-sent (no duplicates). Slash commands (`/compact`, `/clear`, skills…) run inside the Claude Code TUI and emit no submit event, so they are confirmed by the input box clearing instead. As a backstop, a line still unconfirmed after three full sends is dropped with a notification (and kept in the log) rather than resubmitted forever.
 - Delivery is crash-safe against the process being killed mid-flight (cmux reaps notification-hook processes when their notification clears): the confirmed submit is recorded *before* the item is popped, so if the pop never lands the next tick recognizes the recorded submit and pops without resending.
-- If you start typing a new draft while something is queued, delivery backs off until the box is free — your draft is never overwritten.
+- If you start typing a new draft while something is queued, delivery backs off until the box is free — your draft is never overwritten. Claude Code's ghost-text prompt suggestions scrape identically to a typed draft, so they are told apart by a reversible one-key probe (a suggestion sits over an empty input buffer, a draft does not) and never block delivery.
 - A nervous double Opt+Enter cannot enqueue the draft twice: the second capture can race the box clear and scrape the same text again, so an identical line captured within 3 s is dropped. Deliberately re-queueing the same prompt later still works.
 
 ## Limitations
