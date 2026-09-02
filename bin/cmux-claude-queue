@@ -51,6 +51,512 @@ CMUX_BIN="${CMUX_CLAUDE_HOOK_CMUX_BIN:-cmux}"
 command -v "$CMUX_BIN" >/dev/null 2>&1 || CMUX_BIN="/Applications/cmux.app/Contents/Resources/bin/cmux"
 mkdir -p "$QDIR"
 
+# ── Fast dispatch ────────────────────────────────────────────────────────────
+# The two hot entry points run from here, before bash parses the ~1000 lines
+# of function definitions below: the statusline pays that parse every second
+# in every open session, the capture at every keypress. Both arms are
+# self-contained; the capture arm falls through to the full CLI path below
+# when the socket fast path is unavailable.
+case "${1:-capture}" in
+  statusline)
+    # Claude Code statusLine command: if the user had their own statusline
+    # command before installing, it lives in the chain file (a shell script
+    # that gets the statusline JSON on stdin); run it first and print its
+    # output untouched, then append one row with this session's pending queue.
+    # Empty queue = no extra row, the statusline shrinks back automatically.
+    # builtin read instead of a cat spawn (hot path, see below); -d '' reads
+    # to EOF and preserves inner newlines, the rc=1 at EOF is expected
+    payload=""
+    IFS= read -r -d '' payload || :
+    chain="$HOME/.config/cmux-claude-queue/statusline-chain"
+    # This is the hottest path in the whole tool: every open session runs it
+    # on every refresh. session_id is a UUID in flat JSON, so a bash substring
+    # replaces a plutil spawn; plutil stays as the fallback for any shape the
+    # substring does not recognize.
+    sid=${payload#*\"session_id\"}
+    if [ "$sid" = "$payload" ]; then
+      sid=""
+    else
+      sid=${sid#*\"}; sid=${sid%%\"*}
+    fi
+    case "$sid" in
+      *[!0-9a-fA-F-]*|'')
+        sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null) ;;
+    esac
+    # opt-in refresh-cadence tracing: create the flag file to log one line
+    # per wrapper run; costs a single builtin test when absent
+    [ -f "$QDIR/debug-cadence" ] \
+      && printf '%s %s\n' "$(date '+%s')" "$sid" >> "$QDIR/debug-cadence" 2>/dev/null
+    # The sid -> surface mapping is stable for the life of a session binding,
+    # so it is cached in a file and read with a builtin instead of two plutil
+    # spawns per refresh. The cache is re-validated from the store below
+    # whenever a row might actually render (some queue is pending) — a cmux
+    # restart rebinds a resumed session to a new surface id while the sid
+    # persists, and a stale "not mine" must never hide a pending row.
+    resolve_surf() {
+      surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
+        || surf=$(plutil -extract "sessions.claude-$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
+        || surf=""
+      [ -n "$surf" ] && printf '%s\n' "$surf" > "$QDIR/sidmap-$sid"
+    }
+    surf=""
+    if [ -n "$sid" ]; then
+      if [ -f "$QDIR/sidmap-$sid" ]; then
+        IFS= read -r surf < "$QDIR/sidmap-$sid" 2>/dev/null || surf=""
+      fi
+      [ -z "$surf" ] && resolve_surf
+    fi
+    if [ -f "$chain" ]; then
+      # The chained statusline is the expensive part (user HUDs tend to run
+      # git status and friends — seconds per run on a loaded machine), and
+      # Claude Code kills a statusline command that is still running when the
+      # next refresh comes due (hit live: cold chain runs never finished, so
+      # the queue row and the delivery pump below silently stopped). The
+      # chain therefore NEVER runs in the foreground: the last output is
+      # served from a per-session cache immediately, and once the cache is
+      # older than 10 s a detached background job refreshes it for later
+      # runs. The wrapper stays fast no matter what the chain costs;
+      # branch/context info lagging ~10 s is the trade.
+      cache=""
+      [ -n "$sid" ] && cache="$QDIR/slcache-$sid"
+      if [ -z "$cache" ]; then
+        # no session id to key a cache by: degrade to a foreground run
+        base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
+        [ -n "$base" ] && printf '%s\n' "$base"
+      else
+        # $(<file) forks but does not exec — measurably cheaper than cat here
+        if [ -s "$cache" ]; then printf '%s\n' "$(<"$cache")"; fi
+        guard="$cache.bg"
+        if [ -z "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ] \
+           && [ -z "$(/usr/bin/find "$guard" -newermt '-30 seconds' 2>/dev/null)" ]; then
+          # the guard records the worker pid: a chain that hangs past the
+          # 30 s crash TTL is killed here, not accumulated one process per
+          # respawn. The comm check avoids killing an innocent process that
+          # recycled the pid.
+          oldbg=$(cat "$guard" 2>/dev/null)
+          if [ -n "$oldbg" ]; then
+            case "$(ps -o comm= -p "$oldbg" 2>/dev/null)" in
+              *bash|*sh) kill -9 "$oldbg" 2>/dev/null ;;
+            esac
+          fi
+          : > "$guard"  # one refresh in flight at a time; 30 s crash TTL
+          (
+            trap '' TERM HUP
+            # macOS /bin/bash is 3.2 and has no $BASHPID — under set -u the
+            # reference killed this subshell before it ever wrote the cache
+            # (hit live: fresh sessions had a permanently blank statusline).
+            # The PPID of a child shell is this subshell's pid.
+            mypid=$(/bin/sh -c 'echo "$PPID"')
+            echo "$mypid" > "$guard"
+            out=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || out=""
+            if [ -n "$out" ]; then printf '%s\n' "$out" > "$guard.$mypid"
+            else : > "$guard.$mypid"; fi
+            mv -f "$guard.$mypid" "$cache" 2>/dev/null
+            rm -f "$guard"
+            /usr/bin/find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
+          ) </dev/null >/dev/null 2>&1 &
+        fi
+      fi
+    fi
+    # a capture is in flight (hotkey pressed, box not read/enqueued yet):
+    # show the queue row with a placeholder so feedback is one refresh away.
+    # The global stamp is pre-touched by the hotkey daemon at the keypress
+    # itself and exists only until target resolution (~0.3 s, short TTL so
+    # unrelated sessions barely flash it); after that the capture renames it
+    # per-surface and only the captured session's row shows it. The [ -f ]
+    # guards keep the find spawns off the common no-capture path, and once
+    # the queue file has content the real row below replaces the placeholder.
+    show_ph=""
+    if [ -f "$QDIR/capturing.stamp" ]; then
+      if [ -n "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-2 seconds' 2>/dev/null)" ]; then
+        show_ph=1
+      elif [ -z "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-60 seconds' 2>/dev/null)" ]; then
+        # the hotkey daemon pre-touches this stamp at the keypress; if the
+        # capture never spawned, nothing else would ever remove it (a live
+        # capture owns it for at most a few seconds, so 60 s = orphan)
+        rm -f "$QDIR/capturing.stamp"
+      fi
+    fi
+    if [ -z "$show_ph" ] && [ -n "$surf" ] && [ -f "$QDIR/capturing-$surf.stamp" ]; then
+      if [ -n "$(/usr/bin/find "$QDIR/capturing-$surf.stamp" -newermt '-6 seconds' 2>/dev/null)" ]; then
+        show_ph=1
+      else
+        # a crashed capture's leftover: drop it so it stops costing a find
+        rm -f "$QDIR/capturing-$surf.stamp"
+      fi
+    fi
+    if [ -n "$show_ph" ] && { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; }; then
+      printf '\033[33m⏳ Queue:\033[0m \033[2m…\033[0m\n'
+    fi
+    # cheap out: no queue file with content anywhere -> skip the lookup
+    pending=""
+    for qf in "$QDIR"/*.queue; do
+      [ -s "$qf" ] && { pending=1; break; }
+    done
+    [ -z "$pending" ] && exit 0
+    # some queue IS pending: never trust the cached mapping to say "not
+    # mine" — re-resolve from the store (see resolve_surf above), but at most
+    # every 30 s: a queue orphaned by a cmux restart can pend for days, and
+    # unthrottled this would cost two plutil spawns per refresh in EVERY open
+    # session for as long as it does. A store miss keeps the cached value
+    # (better a possibly stale row than a blinking one) and is throttled the
+    # same way.
+    if [ -n "$sid" ]; then
+      if [ ! -f "$QDIR/sidmap-$sid" ] \
+         || [ -z "$(/usr/bin/find "$QDIR/sidmap-$sid" -newermt '-30 seconds' 2>/dev/null)" ]; then
+        prev_surf=$surf
+        resolve_surf
+        if [ -z "$surf" ]; then
+          surf=$prev_surf
+          [ -f "$QDIR/sidmap-$sid" ] && touch "$QDIR/sidmap-$sid" 2>/dev/null
+        fi
+      fi
+    fi
+    # a python only runs below, in the one session that actually owns a
+    # pending queue — not in every session that refreshes while some queue
+    # is waiting
+    { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; } && exit 0
+    out=$(python3 -c '
+import sys
+try:
+    with open(sys.argv[1]) as f:
+        items = [l.strip() for l in f if l.strip()]
+    if not items:
+        raise SystemExit
+    DIM, YEL, RST = "\033[2m", "\033[33m", "\033[0m"
+    nxt = items[0][:70] + ("…" if len(items[0]) > 70 else "")
+    more = f" {DIM}+{len(items) - 1} more{RST}" if len(items) > 1 else ""
+    print(f"{YEL}⏳ Queue:{RST} {nxt}{more}")
+except Exception:
+    pass' "$QDIR/$surf.queue" 2>/dev/null)
+    [ -z "$out" ] && exit 0
+    printf '%s\n' "$out"
+    # delivery pump: an Esc interrupt kills a turn WITHOUT any Stop hook or
+    # turn-complete notification, so a queued prompt would otherwise wait for
+    # an unrelated notification. The statusline re-runs on refreshInterval;
+    # while this session's queue is non-empty, fire the invisible retry tick
+    # at most every 15 s — the notifyhook does the actual careful delivery.
+    stamp="$QDIR/tick.stamp"
+    if [ -z "$(/usr/bin/find "$stamp" -newermt '-15 seconds' 2>/dev/null)" ]; then
+      touch "$stamp"
+      "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$surf" >/dev/null 2>&1
+    fi
+    exit 0
+    ;;
+  capture)
+    # Instant statusline feedback: the hotkey daemon pre-touches this stamp
+    # at the keypress; refresh it here for non-daemon callers and own its
+    # cleanup (the fast path renames it per-surface once the target is known)
+    cstamp="$QDIR/capturing.stamp"
+    touch "$cstamp"
+    trap 'rm -f "$cstamp"' EXIT
+    # Fast path: one python over cmux's control socket. A cmux CLI spawn
+    # costs ~140 ms per call and the capture needs three serially; a socket
+    # request costs ~2 ms, so press-to-box-cleared drops from over a second
+    # under load to roughly 100 ms. Exit 0 = fully handled. Any other exit
+    # falls through to the CLI path below (socket gone, auth refused, older
+    # cmux without these methods); the python mutates nothing before its
+    # queue append, so the fallback can always rerun the whole sequence —
+    # at worst the double-press guard drops the fallback's re-scrape.
+    if python3 - "$STORE" "$EVENTS" "$QDIR" <<'FASTPY'
+import json, os, re, socket, sys, time
+
+store_path, events_path, qdir = sys.argv[1], sys.argv[2], sys.argv[3]
+T0 = time.monotonic()
+stages = []
+
+def mark(name, t0):
+    stages.append("%s:%d" % (name, int((time.monotonic() - t0) * 1000)))
+
+def qlog(msg):
+    with open(qdir + "/log.txt", "a") as f:
+        f.write(time.strftime("%H:%M:%S") + " " + msg + "\n")
+
+# Any failure before the queue append exits 1 with nothing mutated; the bash
+# CLI fallback then redoes the whole capture from scratch.
+t0 = time.monotonic()
+state = os.path.expanduser("~/.local/state/cmux")
+cands = []
+try:
+    p = open(state + "/last-socket-path").read().strip()
+    if p:
+        cands.append(p)
+except OSError:
+    pass
+cands += [state + "/cmux-%d.sock" % os.getuid(), state + "/cmux.sock"]
+sock = None
+for c in cands:
+    try:
+        s_ = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s_.settimeout(4)
+        s_.connect(c)
+        sock = s_
+        break
+    except OSError:
+        continue
+if sock is None:
+    sys.exit(1)
+
+buf = bytearray()
+def readline():
+    while b"\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("socket closed")
+        buf.extend(chunk)
+    line, rest = bytes(buf).split(b"\n", 1)
+    del buf[:]
+    buf.extend(rest)
+    return line
+
+pw = ""
+try:
+    pw = open(state + "/socket-control-password").read().strip()
+except OSError:
+    pass
+if not pw:
+    try:
+        cj = json.load(open(os.path.expanduser("~/.config/cmux/cmux.json")))
+        pw = (cj.get("automation") or {}).get("socketPassword") or ""
+    except Exception:
+        pass
+sock.sendall(("auth " + pw + "\n").encode())
+if not readline().startswith(b"OK"):
+    sys.exit(1)
+
+_rid = [0]
+def call(method, params):
+    _rid[0] += 1
+    req = {"id": _rid[0], "method": method, "params": params}
+    sock.sendall((json.dumps(req, separators=(",", ":")) + "\n").encode())
+    r = json.loads(readline())
+    if not r.get("ok"):
+        raise RuntimeError("%s: %s" % (method, r.get("error")))
+    return r.get("result") or {}
+mark("auth", t0)
+
+t0 = time.monotonic()
+ws = os.environ.get("CMUX_WORKSPACE_ID") or ""
+if not ws:
+    ws = call("workspace.current", {}).get("workspace", {}).get("id") or ""
+if not ws:
+    sys.exit(1)
+target = sid = ""
+running = 0
+try:
+    d = json.load(open(store_path))
+except Exception:
+    d = {}
+s0 = (d.get("activeSessionsByWorkspace", {}).get(ws, {}).get("sessionId") or "")
+if s0.startswith("claude-"):
+    s0 = s0[7:]
+sess = d.get("sessions", {}).get(s0, {})
+if sess.get("surfaceId"):
+    target, sid = sess["surfaceId"], s0
+    if sess.get("agentLifecycle") == "running":
+        running = 1
+if not target:
+    # store miss (e.g. right after a cmux restart): live surface.list truth
+    best = None
+    for sr in call("surface.list", {"workspace_id": ws}).get("surfaces", []):
+        rb = sr.get("resume_binding") or {}
+        if rb.get("kind") == "claude" and sr.get("id"):
+            t = rb.get("updated_at") or 0
+            if best is None or t > best[0]:
+                best = (t, sr["id"])
+    if best:
+        target = best[1]
+        running = 1  # lifecycle unknown: queueing beats a blind submit
+if not target:
+    sys.exit(1)  # the CLI fallback owns the "no claude session" messaging
+if sid and not running:
+    # the store lags right after a submit; cross-check fresh hook events
+    try:
+        f = open(events_path, "rb")
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 2097152))
+        needle = ("claude-" + sid).encode()
+        last = b""
+        for line in f.read().splitlines():
+            if needle in line and (b"agent.hook.UserPromptSubmit" in line
+                                   or b'"agent.hook.Stop"' in line):
+                last = line
+        if b"UserPromptSubmit" in last:
+            running = 1
+    except OSError:
+        pass
+# narrow the transient placeholder row to the captured session
+surface_stamp = qdir + "/capturing-" + target + ".stamp"
+try:
+    os.replace(qdir + "/capturing.stamp", surface_stamp)
+except OSError:
+    try:
+        open(surface_stamp, "w").close()
+    except OSError:
+        pass
+mark("resolve", t0)
+
+t0 = time.monotonic()
+def read_box():
+    # same width-aware rules as parse_input_box; read_text renders NBSP
+    # where the CLI read-screen renders plain spaces
+    dump = (call("surface.read_text", {"surface_id": target}).get("text") or "")
+    lines = dump.replace("\xa0", " ").split("\n")
+    seps = [i for i, l in enumerate(lines) if re.match(r"^\s*─{20,}\s*$", l)]
+    if len(seps) < 2:
+        return "", 0
+    width = len(lines[seps[-1]].rstrip())
+    region = lines[seps[-2] + 1:seps[-1]]
+    pieces, started = [], False
+    for l in region:
+        full = len(l.rstrip()) >= width - 2
+        if not started:
+            m = re.match(r"^ ?[❯>]\s?(.*)$", l)
+            if m:
+                started = True
+                pieces.append((m.group(1).rstrip(), full))
+        else:
+            t = l.rstrip()
+            if t.startswith("  "):
+                t = t[2:]
+            pieces.append((t, full))
+    out = []
+    for t, full in pieces:
+        if not t:
+            continue
+        out.append(t)
+        out.append("" if full else " ")
+    return "".join(out).strip(), len(region)
+
+text, rows = read_box()
+mark("read", t0)
+
+def finish():
+    try:
+        os.remove(surface_stamp)
+    except OSError:
+        pass
+    own = os.environ.get("CMUX_SURFACE_ID") or ""
+    if own:
+        # Command Palette path: hand focus back and close our action tab
+        for m, p in (("surface.focus", {"surface_id": target}),
+                     ("surface.close", {"surface_id": own})):
+            try:
+                call(m, p)
+            except Exception:
+                pass
+    sys.exit(0)
+
+if not running:
+    if text:
+        call("surface.send_key", {"surface_id": target, "key": "enter"})
+        qlog("capture surface=%s idle, submitted draft: %s" % (target, text))
+    finish()
+
+if not text:
+    finish()
+
+# double-press guard: an identical tail line captured within 3 s is the
+# second press racing the box clear, not an intentional repeat
+qfile = qdir + "/" + target + ".queue"
+dup = False
+try:
+    st = os.stat(qfile)
+    if st.st_size and time.time() - st.st_mtime < 3:
+        with open(qfile) as f:
+            qlines = [l.rstrip("\n") for l in f if l.strip()]
+        if qlines and qlines[-1] == text:
+            dup = True
+except OSError:
+    pass
+
+if dup:
+    qlog("capture surface=%s dropped double-press duplicate: %s" % (target, text))
+else:
+    # record first, clear second: killed in between, the draft is both
+    # queued and still in the box (delivery treats box == line as
+    # clear-and-resend), so nothing is lost
+    t0 = time.monotonic()
+    lock = qdir + "/" + target + ".qlock"
+    got = False
+    for _ in range(20):
+        try:
+            os.mkdir(lock)
+            got = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > 5:
+                    os.rmdir(lock)
+                    continue
+            except OSError:
+                continue
+            time.sleep(0.05)
+    try:
+        empty = True
+        try:
+            empty = os.path.getsize(qfile) == 0
+        except OSError:
+            pass
+        if empty:
+            try:
+                with open(qdir + "/" + target + ".qoffset", "w") as f:
+                    f.write("%d\n" % os.path.getsize(events_path))
+            except OSError:
+                pass
+        with open(qfile, "a") as f:
+            f.write(text + "\n")
+    finally:
+        if got:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+    mark("append", t0)
+
+# Clear the WHOLE box: Ctrl+U alone only kills the current line (hit live
+# with a multi-line draft, the other lines stayed behind). Per row: Ctrl+K
+# (cursor to EOL), Ctrl+U (to line start), Backspace (join up); every key
+# no-ops on an empty box, so overshooting by two cycles is free.
+t0 = time.monotonic()
+def clear_cycles(n):
+    call("surface.send_text", {"surface_id": target, "text": "\x0b\x15\x7f" * n})
+cleared = False
+clear_cycles(rows + 2)
+time.sleep(0.06)  # give the TUI one redraw before verifying, or the first
+                  # read always shows the old content and costs a retry round
+for _ in range(3):
+    box2, rows2 = read_box()
+    if not box2 or box2 not in text:
+        cleared = True  # empty, or unrelated content (ghost suggestion)
+        break
+    clear_cycles(rows2 + 2)
+    time.sleep(0.12)
+mark("clear", t0)
+
+if not dup:
+    qlog("capture surface=%s queued in %dms via socket (%s)%s: %s"
+         % (target, int((time.monotonic() - T0) * 1000), " ".join(stages),
+            "" if cleared else " [box not fully cleared]", text))
+    # insurance tick: if the turn actually just ended (stale running state)
+    # the hook delivers right away; while truly running it no-ops
+    try:
+        call("notification.create_for_surface",
+             {"surface_id": target, "title": "cmux-claude-queue-tick",
+              "body": "tick"})
+    except Exception:
+        pass
+finish()
+FASTPY
+    then
+      exit 0
+    fi
+    printf '%s %s\n' "$(date '+%H:%M:%S')" \
+      "capture: socket fast path failed, using CLI fallback" >> "$QDIR/log.txt"
+    ;;
+esac
+
+
 # Every mtime age check below pins /usr/bin/find: the -newermt '-N seconds'
 # relative form is what macOS find parses, while common PATH replacements
 # (bfs, GNU findutils) reject or reinterpret it — silently, inside $().
@@ -221,16 +727,29 @@ if target:
         lines = dump.split("\n")
         seps = [i for i, l in enumerate(lines) if re.match(r"^\s*─{20,}\s*$", l)]
         if len(seps) >= 2:
-            parts, started = [], False
+            # width-aware wrap reconstruction, same rules as parse_input_box
+            # (the old plain space-join here spliced spaces into wrapped URLs)
+            width = len(lines[seps[-1]].rstrip())
+            pieces, started = [], False
             for l in lines[seps[-2] + 1 : seps[-1]]:
+                full = len(l.rstrip()) >= width - 2
                 if not started:
                     m = re.match(r"^[❯>]\s?(.*)$", l)
                     if m:
                         started = True
-                        parts.append(m.group(1).rstrip())
+                        pieces.append((m.group(1).rstrip(), full))
                 else:
-                    parts.append(l.rstrip())
-        text = " ".join(p for p in parts if p).strip() if len(seps) >= 2 else ""
+                    t = l.rstrip()
+                    if t.startswith("  "):
+                        t = t[2:]
+                    pieces.append((t, full))
+            out = []
+            for t, full in pieces:
+                if not t:
+                    continue
+                out.append(t)
+                out.append("" if full else " ")
+            text = "".join(out).strip()
     except Exception:
         pass
 print(f"{target}\x1f{sid}\x1f{running}\x1f{text}")
@@ -798,7 +1317,11 @@ case "$cmd" in
           printf '%s\n' "$text" >> "$QDIR/$target.queue"
         fi
       fi
-      "$CMUX_BIN" send --surface "$target" $'\x15' >/dev/null 2>&1
+      # Ctrl+U alone only kills the current line of a multi-line draft; per
+      # row: Ctrl+K, Ctrl+U, Backspace (join up) — all no-ops on an empty
+      # box, so a blind 8-row overshoot is free (fallback path only; the
+      # fast path counts the real rows)
+      "$CMUX_BIN" send --surface "$target" $'\x0b\x15\x7f\x0b\x15\x7f\x0b\x15\x7f\x0b\x15\x7f\x0b\x15\x7f\x0b\x15\x7f\x0b\x15\x7f\x0b\x15\x7f' >/dev/null 2>&1
     fi
     "$CMUX_BIN" rpc surface.focus "{\"surface_id\": \"$target\"}" >/dev/null 2>&1
     if [ -n "$text" ]; then
@@ -808,192 +1331,6 @@ case "$cmd" in
       "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$target" >/dev/null 2>&1
     fi
     [ -n "${CMUX_SURFACE_ID:-}" ] && "$CMUX_BIN" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1
-    exit 0
-    ;;
-
-  statusline)
-    # Claude Code statusLine command: if the user had their own statusline
-    # command before installing, it lives in the chain file (a shell script
-    # that gets the statusline JSON on stdin); run it first and print its
-    # output untouched, then append one row with this session's pending queue.
-    # Empty queue = no extra row, the statusline shrinks back automatically.
-    # builtin read instead of a cat spawn (hot path, see below); -d '' reads
-    # to EOF and preserves inner newlines, the rc=1 at EOF is expected
-    payload=""
-    IFS= read -r -d '' payload || :
-    chain="$HOME/.config/cmux-claude-queue/statusline-chain"
-    # This is the hottest path in the whole tool: every open session runs it
-    # on every refresh. session_id is a UUID in flat JSON, so a bash substring
-    # replaces a plutil spawn; plutil stays as the fallback for any shape the
-    # substring does not recognize.
-    sid=${payload#*\"session_id\"}
-    if [ "$sid" = "$payload" ]; then
-      sid=""
-    else
-      sid=${sid#*\"}; sid=${sid%%\"*}
-    fi
-    case "$sid" in
-      *[!0-9a-fA-F-]*|'')
-        sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null) ;;
-    esac
-    # opt-in refresh-cadence tracing: create the flag file to log one line
-    # per wrapper run; costs a single builtin test when absent
-    [ -f "$QDIR/debug-cadence" ] \
-      && printf '%s %s\n' "$(date '+%s')" "$sid" >> "$QDIR/debug-cadence" 2>/dev/null
-    # The sid -> surface mapping is stable for the life of a session binding,
-    # so it is cached in a file and read with a builtin instead of two plutil
-    # spawns per refresh. The cache is re-validated from the store below
-    # whenever a row might actually render (some queue is pending) — a cmux
-    # restart rebinds a resumed session to a new surface id while the sid
-    # persists, and a stale "not mine" must never hide a pending row.
-    resolve_surf() {
-      surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
-        || surf=$(plutil -extract "sessions.claude-$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
-        || surf=""
-      [ -n "$surf" ] && printf '%s\n' "$surf" > "$QDIR/sidmap-$sid"
-    }
-    surf=""
-    if [ -n "$sid" ]; then
-      if [ -f "$QDIR/sidmap-$sid" ]; then
-        IFS= read -r surf < "$QDIR/sidmap-$sid" 2>/dev/null || surf=""
-      fi
-      [ -z "$surf" ] && resolve_surf
-    fi
-    if [ -f "$chain" ]; then
-      # The chained statusline is the expensive part (user HUDs tend to run
-      # git status and friends — seconds per run on a loaded machine), and
-      # Claude Code kills a statusline command that is still running when the
-      # next refresh comes due (hit live: cold chain runs never finished, so
-      # the queue row and the delivery pump below silently stopped). The
-      # chain therefore NEVER runs in the foreground: the last output is
-      # served from a per-session cache immediately, and once the cache is
-      # older than 10 s a detached background job refreshes it for later
-      # runs. The wrapper stays fast no matter what the chain costs;
-      # branch/context info lagging ~10 s is the trade.
-      cache=""
-      [ -n "$sid" ] && cache="$QDIR/slcache-$sid"
-      if [ -z "$cache" ]; then
-        # no session id to key a cache by: degrade to a foreground run
-        base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
-        [ -n "$base" ] && printf '%s\n' "$base"
-      else
-        # $(<file) forks but does not exec — measurably cheaper than cat here
-        if [ -s "$cache" ]; then printf '%s\n' "$(<"$cache")"; fi
-        guard="$cache.bg"
-        if [ -z "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ] \
-           && [ -z "$(/usr/bin/find "$guard" -newermt '-30 seconds' 2>/dev/null)" ]; then
-          # the guard records the worker pid: a chain that hangs past the
-          # 30 s crash TTL is killed here, not accumulated one process per
-          # respawn. The comm check avoids killing an innocent process that
-          # recycled the pid.
-          oldbg=$(cat "$guard" 2>/dev/null)
-          if [ -n "$oldbg" ]; then
-            case "$(ps -o comm= -p "$oldbg" 2>/dev/null)" in
-              *bash|*sh) kill -9 "$oldbg" 2>/dev/null ;;
-            esac
-          fi
-          : > "$guard"  # one refresh in flight at a time; 30 s crash TTL
-          (
-            trap '' TERM HUP
-            # macOS /bin/bash is 3.2 and has no $BASHPID — under set -u the
-            # reference killed this subshell before it ever wrote the cache
-            # (hit live: fresh sessions had a permanently blank statusline).
-            # The PPID of a child shell is this subshell's pid.
-            mypid=$(/bin/sh -c 'echo "$PPID"')
-            echo "$mypid" > "$guard"
-            out=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || out=""
-            if [ -n "$out" ]; then printf '%s\n' "$out" > "$guard.$mypid"
-            else : > "$guard.$mypid"; fi
-            mv -f "$guard.$mypid" "$cache" 2>/dev/null
-            rm -f "$guard"
-            /usr/bin/find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
-          ) </dev/null >/dev/null 2>&1 &
-        fi
-      fi
-    fi
-    # a capture is in flight (hotkey pressed, box not read/enqueued yet):
-    # show the queue row with a placeholder so feedback is one refresh away.
-    # The global stamp is pre-touched by the hotkey daemon at the keypress
-    # itself and exists only until target resolution (~0.3 s, short TTL so
-    # unrelated sessions barely flash it); after that the capture renames it
-    # per-surface and only the captured session's row shows it. The [ -f ]
-    # guards keep the find spawns off the common no-capture path, and once
-    # the queue file has content the real row below replaces the placeholder.
-    show_ph=""
-    if [ -f "$QDIR/capturing.stamp" ]; then
-      if [ -n "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-2 seconds' 2>/dev/null)" ]; then
-        show_ph=1
-      elif [ -z "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-60 seconds' 2>/dev/null)" ]; then
-        # the hotkey daemon pre-touches this stamp at the keypress; if the
-        # capture never spawned, nothing else would ever remove it (a live
-        # capture owns it for at most a few seconds, so 60 s = orphan)
-        rm -f "$QDIR/capturing.stamp"
-      fi
-    fi
-    if [ -z "$show_ph" ] && [ -n "$surf" ] && [ -f "$QDIR/capturing-$surf.stamp" ]; then
-      if [ -n "$(/usr/bin/find "$QDIR/capturing-$surf.stamp" -newermt '-6 seconds' 2>/dev/null)" ]; then
-        show_ph=1
-      else
-        # a crashed capture's leftover: drop it so it stops costing a find
-        rm -f "$QDIR/capturing-$surf.stamp"
-      fi
-    fi
-    if [ -n "$show_ph" ] && { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; }; then
-      printf '\033[33m⏳ Queue:\033[0m \033[2m…\033[0m\n'
-    fi
-    # cheap out: no queue file with content anywhere -> skip the lookup
-    pending=""
-    for qf in "$QDIR"/*.queue; do
-      [ -s "$qf" ] && { pending=1; break; }
-    done
-    [ -z "$pending" ] && exit 0
-    # some queue IS pending: never trust the cached mapping to say "not
-    # mine" — re-resolve from the store (see resolve_surf above), but at most
-    # every 30 s: a queue orphaned by a cmux restart can pend for days, and
-    # unthrottled this would cost two plutil spawns per refresh in EVERY open
-    # session for as long as it does. A store miss keeps the cached value
-    # (better a possibly stale row than a blinking one) and is throttled the
-    # same way.
-    if [ -n "$sid" ]; then
-      if [ ! -f "$QDIR/sidmap-$sid" ] \
-         || [ -z "$(/usr/bin/find "$QDIR/sidmap-$sid" -newermt '-30 seconds' 2>/dev/null)" ]; then
-        prev_surf=$surf
-        resolve_surf
-        if [ -z "$surf" ]; then
-          surf=$prev_surf
-          [ -f "$QDIR/sidmap-$sid" ] && touch "$QDIR/sidmap-$sid" 2>/dev/null
-        fi
-      fi
-    fi
-    # a python only runs below, in the one session that actually owns a
-    # pending queue — not in every session that refreshes while some queue
-    # is waiting
-    { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; } && exit 0
-    out=$(python3 -c '
-import sys
-try:
-    with open(sys.argv[1]) as f:
-        items = [l.strip() for l in f if l.strip()]
-    if not items:
-        raise SystemExit
-    DIM, YEL, RST = "\033[2m", "\033[33m", "\033[0m"
-    nxt = items[0][:70] + ("…" if len(items[0]) > 70 else "")
-    more = f" {DIM}+{len(items) - 1} more{RST}" if len(items) > 1 else ""
-    print(f"{YEL}⏳ Queue:{RST} {nxt}{more}")
-except Exception:
-    pass' "$QDIR/$surf.queue" 2>/dev/null)
-    [ -z "$out" ] && exit 0
-    printf '%s\n' "$out"
-    # delivery pump: an Esc interrupt kills a turn WITHOUT any Stop hook or
-    # turn-complete notification, so a queued prompt would otherwise wait for
-    # an unrelated notification. The statusline re-runs on refreshInterval;
-    # while this session's queue is non-empty, fire the invisible retry tick
-    # at most every 15 s — the notifyhook does the actual careful delivery.
-    stamp="$QDIR/tick.stamp"
-    if [ -z "$(/usr/bin/find "$stamp" -newermt '-15 seconds' 2>/dev/null)" ]; then
-      touch "$stamp"
-      "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$surf" >/dev/null 2>&1
-    fi
     exit 0
     ;;
 
