@@ -783,11 +783,16 @@ case "$cmd" in
           : > "$guard"  # one refresh in flight at a time; 30 s crash TTL
           (
             trap '' TERM HUP
-            echo "$BASHPID" > "$guard"
+            # macOS /bin/bash is 3.2 and has no $BASHPID — under set -u the
+            # reference killed this subshell before it ever wrote the cache
+            # (hit live: fresh sessions had a permanently blank statusline).
+            # The PPID of a child shell is this subshell's pid.
+            mypid=$(/bin/sh -c 'echo "$PPID"')
+            echo "$mypid" > "$guard"
             out=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || out=""
-            if [ -n "$out" ]; then printf '%s\n' "$out" > "$guard.$BASHPID"
-            else : > "$guard.$BASHPID"; fi
-            mv -f "$guard.$BASHPID" "$cache" 2>/dev/null
+            if [ -n "$out" ]; then printf '%s\n' "$out" > "$guard.$mypid"
+            else : > "$guard.$mypid"; fi
+            mv -f "$guard.$mypid" "$cache" 2>/dev/null
             rm -f "$guard"
             /usr/bin/find "$QDIR" -name 'slcache-*' -mtime +1 -delete 2>/dev/null
           ) </dev/null >/dev/null 2>&1 &
