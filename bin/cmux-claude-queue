@@ -7,13 +7,20 @@
 #
 # Architecture (three cooperating entry points):
 #
-#   capture     spawned by the cmux-claude-queue-hotkeyd daemon when the user
-#               presses Opt+Enter with cmux frontmost (or manually via the
-#               optional "queue-prompt" cmux Command Palette action). Scrapes
-#               the Claude input box off the terminal screen. Idle session:
-#               just submits the draft. Turn running: clears the box and
-#               appends the draft to the file queue; the pending queue shows
-#               up in the Claude Code statusline (`statusline` mode).
+#   capture     scrapes the Claude input box off the terminal screen. Idle
+#               session: just submits the draft. Turn running: clears the box
+#               and appends the draft to the file queue; the pending queue
+#               shows up in the Claude Code statusline (`statusline` mode).
+#               Invoked manually, from the optional "queue-prompt" cmux
+#               Command Palette action, or as the hotkey daemon's fallback —
+#               on Opt+Enter the daemon normally does this part in-process
+#               over its own warm control socket, because spawning this costs
+#               100-500 ms of fork/exec + python start before anything visible
+#               happens (see hotkeyd/main.swift).
+#   spool       deferred half of that in-process capture, spawned by the
+#               daemon once the box is already cleared. Reads the spooled raw
+#               screen dump, parses the draft, appends it to the queue and
+#               nudges delivery. Everything here is off the perceived path.
 #   statusline  Claude Code statusLine command (settings.json): runs the
 #               user's previous statusline command first (chain file), then
 #               appends one row with the pending queue for the session on
@@ -34,12 +41,14 @@
 #
 # Modes:
 #   cmux-claude-queue capture              scrape + clear + enqueue + deliver-if-idle
+#   cmux-claude-queue spool <surface>      drain spooled captures into the queue
 #   cmux-claude-queue statusline           Claude Code statusLine wrapper (JSON stdin)
 #   cmux-claude-queue notifyhook           cmux notification hook (JSON stdin/stdout)
 #   cmux-claude-queue add <surface> <text> enqueue text for a surface, deliver if idle
 #   cmux-claude-queue drain <surface>      blocking drain loop (manual/debug use)
 #
 # State: ~/.claude/prompt-queue/<surfaceId>.queue (one message per line)
+#        ~/.claude/prompt-queue/<surfaceId>.<epochMs>.spool (in-flight capture)
 
 set -u
 
@@ -186,8 +195,29 @@ case "${1:-capture}" in
       fi
     fi
     if [ -n "$show_ph" ] && { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; }; then
-      printf '\033[33m⏳ Queue:\033[0m \033[2m…\033[0m\n'
+      printf '\033[33m⏳ Queuing…\033[0m\n'
     fi
+    # An orphaned spool holds the ONLY copy of a draft: the hotkey daemon
+    # spooled it and cleared the box, then its handler never ran. Nothing else
+    # will notice it here — the pending check below cannot see it (no queue
+    # file exists yet), and the notifyhook's recovery sweep needs a
+    # notification, which an Esc-interrupted turn never produces. So run the
+    # handler straight from here, detached, throttled to one attempt per 10 s
+    # across all sessions. Anything under 5 s old is a live handoff.
+    for sf in "$QDIR"/*.spool; do
+      [ -e "$sf" ] || break   # no matches: the glob came through unexpanded
+      [ -n "$(/usr/bin/find "$sf" -newermt '-5 seconds' 2>/dev/null)" ] && continue
+      if [ -z "$(/usr/bin/find "$QDIR/spoolsweep.stamp" -newermt '-10 seconds' 2>/dev/null)" ]; then
+        touch "$QDIR/spoolsweep.stamp"
+        sb=${sf##*/}; sb=${sb%.*.spool}
+        # ignored signals survive exec, so the handler cannot be killed by
+        # Claude Code reaping this statusline run's process group when the next
+        # refresh comes due — killed between the queue append and the spool
+        # delete, the next poke would enqueue the same draft again
+        (trap '' TERM HUP; "$0" spool "$sb" </dev/null >/dev/null 2>&1 &)
+      fi
+      break
+    done
     # cheap out: no queue file with content anywhere -> skip the lookup
     pending=""
     for qf in "$QDIR"/*.queue; do
@@ -385,6 +415,19 @@ if sid and not running:
             running = 1
     except OSError:
         pass
+# A delivery is typing into this box right now: what is in it is the pump's
+# own prompt, not a draft of the user's. Scraping it would clear the pump's
+# text mid-send and queue a second copy of a prompt already on its way.
+# Nothing of the user's is lost by declining — there was nothing of theirs
+# in there.
+try:
+    holder = int(os.readlink(qdir + "/" + target + ".lock"))
+    os.kill(holder, 0)
+    qlog("capture surface=%s delivery in flight, ignoring press" % target)
+    sys.exit(0)
+except (OSError, ValueError):
+    pass
+
 # narrow the transient placeholder row to the captured session
 surface_stamp = qdir + "/capturing-" + target + ".stamp"
 try:
@@ -554,6 +597,282 @@ FASTPY
     printf '%s %s\n' "$(date '+%H:%M:%S')" \
       "capture: socket fast path failed, using CLI fallback" >> "$QDIR/log.txt"
     ;;
+  spool)
+    # Deferred half of the hotkey daemon's in-process capture. The daemon has
+    # already spooled the raw screen dump and cleared the box (that is the part
+    # the user waits for); everything here is off the perceived path, so it
+    # stays in python where the subtle logic already lives and is debugged.
+    #
+    # Spools are named <surfaceId>.<epochMs>.spool, so sorting them by name
+    # replays presses in order. Every spool is deleted only after its draft is
+    # in the queue file, which is what makes a crashed or never-spawned handler
+    # recoverable: the next capture — or the notifyhook's orphan sweep — picks
+    # up whatever is left behind.
+    surf="${2:-}"
+    [ -z "$surf" ] && exit 0
+    if ! python3 - "$QDIR" "$EVENTS" "$surf" <<'SPOOLPY'
+import json, os, re, socket, sys, time
+
+qdir, events_path, surf = sys.argv[1], sys.argv[2], sys.argv[3]
+T0 = time.monotonic()
+qfile = qdir + "/" + surf + ".queue"
+
+def qlog(msg):
+    with open(qdir + "/log.txt", "a") as f:
+        f.write(time.strftime("%H:%M:%S") + " " + msg + "\n")
+
+# Identical rules to the capture fast path's read_box, against the spooled
+# dump instead of a live socket read. The width-aware join — a trailing space
+# is a real space, a full-width row is a hard wrap with none — is what the
+# daemon deliberately does NOT reimplement in Swift: it only counts rows and
+# asks whether the box is non-empty, so the delicate part stays on this side.
+# (It is not single-sourced even here: parse_input_box, capture_ctx and FASTPY
+# read_box each carry the same rules for their own entry point.)
+def parse_box(dump):
+    lines = dump.replace("\xa0", " ").split("\n")
+    seps = [i for i, l in enumerate(lines) if re.match(r"^\s*─{20,}\s*$", l)]
+    if len(seps) < 2:
+        return "", 0
+    width = len(lines[seps[-1]].rstrip())
+    region = lines[seps[-2] + 1:seps[-1]]
+    pieces, started = [], False
+    for l in region:
+        full = len(l.rstrip()) >= width - 2
+        if not started:
+            m = re.match(r"^ ?[❯>]\s?(.*)$", l)
+            if m:
+                started = True
+                pieces.append((m.group(1).rstrip(), full))
+        else:
+            t = l.rstrip()
+            if t.startswith("  "):
+                t = t[2:]
+            pieces.append((t, full))
+    out = []
+    for t, full in pieces:
+        if not t:
+            continue
+        out.append(t)
+        out.append("" if full else " ")
+    return "".join(out).strip(), len(region)
+
+def enqueue(text):
+    lock = qdir + "/" + surf + ".qlock"
+    got = False
+    for _ in range(20):
+        try:
+            os.mkdir(lock)
+            got = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > 5:
+                    os.rmdir(lock)
+                    continue
+            except OSError:
+                continue
+            time.sleep(0.05)
+    try:
+        # Double-press guard: a second Opt+Enter can outrun the box clear and
+        # spool the same draft again. An identical line appended moments ago is
+        # that race, not an intentional repeat.
+        #
+        # Checked INSIDE the lock. Three things now spawn this handler — the
+        # daemon after a capture, the statusline's orphan poke and the
+        # notifyhook sweep — so two of them running for the same surface is an
+        # ordinary occurrence, not a freak one. Checked before taking the lock,
+        # both would read the same queue tail, both would pass, and the lock
+        # would then serialize two appends of the same prompt.
+        try:
+            st = os.stat(qfile)
+            if st.st_size and time.time() - st.st_mtime < 3:
+                with open(qfile) as f:
+                    qlines = [l.rstrip("\n") for l in f if l.strip()]
+                if qlines and qlines[-1] == text:
+                    return False
+        except OSError:
+            pass
+        # first line into an empty queue: remember where the event log stood,
+        # so delivery can tell "already submitted since queueing" apart from
+        # any older identical submit
+        empty = True
+        try:
+            empty = os.path.getsize(qfile) == 0
+        except OSError:
+            pass
+        if empty:
+            try:
+                with open(qdir + "/" + surf + ".qoffset", "w") as f:
+                    f.write("%d\n" % os.path.getsize(events_path))
+            except OSError:
+                pass
+        with open(qfile, "a") as f:
+            f.write(text + "\n")
+    finally:
+        if got:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+    return True
+
+try:
+    names = sorted(n for n in os.listdir(qdir)
+                   if n.startswith(surf + ".") and n.endswith(".spool"))
+except OSError:
+    names = []
+if not names:
+    sys.exit(0)
+
+t0 = time.monotonic()
+last_text, last_rows, queued, dropped = "", 0, 0, 0
+for name in names:
+    path = qdir + "/" + name
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.loads(f.readline())
+            dump = f.read()
+    except Exception:
+        # unreadable spool: nothing to recover, drop it rather than have the
+        # orphan sweep retry it forever
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        continue
+    text, rows = parse_box(dump)
+    if not rows:
+        rows = meta.get("rows") or 0
+    if text:
+        last_text, last_rows = text, rows
+        if enqueue(text):
+            queued += 1
+            qlog("spool surface=%s queued: %s" % (surf, text))
+        else:
+            dropped += 1
+            qlog("spool surface=%s dropped double-press duplicate: %s" % (surf, text))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+append_ms = int((time.monotonic() - t0) * 1000)
+
+# the placeholder row has done its job once the real queue row can render
+try:
+    os.remove(qdir + "/capturing-" + surf + ".stamp")
+except OSError:
+    pass
+
+if not queued and not dropped:
+    sys.exit(0)
+
+# Verify the daemon's clear landed, and nudge delivery. Both need the control
+# socket, but neither is on the perceived path, so a cold connect is fine here
+# (and a failure only costs a CLI notify fallback in the caller).
+state = os.path.expanduser("~/.local/state/cmux")
+cands = []
+try:
+    p = open(state + "/last-socket-path").read().strip()
+    if p:
+        cands.append(p)
+except OSError:
+    pass
+cands += [state + "/cmux-%d.sock" % os.getuid(), state + "/cmux.sock"]
+sock = None
+for c in cands:
+    try:
+        s_ = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s_.settimeout(4)
+        s_.connect(c)
+        sock = s_
+        break
+    except OSError:
+        continue
+if sock is None:
+    sys.exit(2)  # caller falls back to a CLI notify tick
+
+buf = bytearray()
+def readline():
+    while b"\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("socket closed")
+        buf.extend(chunk)
+    line, rest = bytes(buf).split(b"\n", 1)
+    del buf[:]
+    buf.extend(rest)
+    return line
+
+pw = ""
+try:
+    pw = open(state + "/socket-control-password").read().strip()
+except OSError:
+    pass
+if not pw:
+    try:
+        cj = json.load(open(os.path.expanduser("~/.config/cmux/cmux.json")))
+        pw = (cj.get("automation") or {}).get("socketPassword") or ""
+    except Exception:
+        pass
+sock.sendall(("auth " + pw + "\n").encode())
+if not readline().startswith(b"OK"):
+    sys.exit(2)
+
+_rid = [0]
+def call(method, params):
+    _rid[0] += 1
+    req = {"id": _rid[0], "method": method, "params": params}
+    sock.sendall((json.dumps(req, separators=(",", ":")) + "\n").encode())
+    r = json.loads(readline())
+    if not r.get("ok"):
+        raise RuntimeError("%s: %s" % (method, r.get("error")))
+    return r.get("result") or {}
+
+def clear_cycles(n):
+    call("surface.send_text", {"surface_id": surf, "text": "\x0b\x15\x7f" * n})
+
+cleared = True
+try:
+    if last_text:
+        # The box is already visually clear by the time this runs — the daemon
+        # cleared it before spawning us — so anything found here is either a
+        # clear that did not land, or the user typing their NEXT draft. The
+        # whole point of the fast path is to invite exactly that follow-up
+        # typing, so the test has to be strict: only a substantial remnant
+        # counts as un-cleared. A bare "box in last_text" would treat the first
+        # few characters of a similar next draft ("fix" against "fix the
+        # tests") as leftovers and delete the user's live keystrokes. The old
+        # spawn-free path could be loose about this because it verified within
+        # ~60 ms, before anyone could type.
+        cleared = False
+        time.sleep(0.06)
+        for _ in range(3):
+            box, rows = parse_box(call("surface.read_text",
+                                       {"surface_id": surf}).get("text") or "")
+            remnant = box == last_text or (len(box) >= 8 and box in last_text)
+            if not remnant:
+                cleared = True
+                break
+            clear_cycles((rows or last_rows) + 2)
+            time.sleep(0.12)
+    # insurance tick: if the turn actually just ended (stale running state)
+    # the hook delivers right away; while truly running it no-ops
+    call("notification.create_for_surface",
+         {"surface_id": surf, "title": "cmux-claude-queue-tick", "body": "tick"})
+except Exception:
+    sys.exit(2)
+
+qlog("spool surface=%s handled %d queued %d dup in %dms (append:%d)%s"
+     % (surf, queued, dropped, int((time.monotonic() - T0) * 1000), append_ms,
+        "" if cleared else " [box needed re-clear]"))
+SPOOLPY
+    then
+      # no socket: keep the delivery nudge, just pay a CLI spawn for it
+      "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick \
+        --surface "$surf" >/dev/null 2>&1
+    fi
+    exit 0
+    ;;
 esac
 
 
@@ -677,6 +996,22 @@ print("".join(out).strip())
 
 read_box() { "$CMUX_BIN" read-screen --surface "$1" 2>/dev/null | parse_input_box; }
 
+# Is what the input box shows a Claude Code prompt SUGGESTION rather than a
+# typed draft? The suggestion scrapes exactly like a draft (same ❯ prefix; no
+# style attribute survives read-screen), but it is display-only over an EMPTY
+# buffer: after typing one character the box holds just that character, while
+# a real draft holds draft+char. The backspace undoes the probe either way (a
+# suggestion simply re-renders on the empty box). Only safe on an idle
+# session, where a stray keystroke cannot steer a running turn.
+box_is_ghost() {
+  local probe=""
+  "$CMUX_BIN" send --surface "$1" "x" >>"$QDIR/log.txt" 2>&1 || return 1
+  sleep 0.3
+  probe=$(read_box "$1")
+  "$CMUX_BIN" send-key --surface "$1" backspace >>"$QDIR/log.txt" 2>&1
+  [ "$probe" = "x" ]
+}
+
 # One-shot context read for capture, optimized for latency (the user just hit
 # the hotkey and is waiting for the box to clear): store + events tail +
 # read-screen + input-box parse, all in a SINGLE python process — interpreter
@@ -772,10 +1107,19 @@ events_running() {
 # Hook events are the primary truth (newest UserPromptSubmit vs Stop), BUT an
 # Esc interrupt emits NO Stop hook, no sidebar update and no notification
 # (verified in events.jsonl) — both the store and the events stay
-# "running" forever. A hook-based running verdict older than 30 s is therefore
-# reported as "stale" and the caller re-checks the live TUI screen (30 s keeps
-# the worst post-Esc stall short while still trusting fresh hook data). With
-# no usable events the store's agentLifecycle decides.
+# "running" forever. A hook-based running verdict with no sign of life for
+# 30 s is therefore reported as "stale" and the caller re-checks the live TUI
+# screen (30 s keeps the worst post-Esc stall short while still trusting fresh
+# hook data). With no usable events the store's agentLifecycle decides.
+#
+# "Sign of life" is the newest hook event of ANY kind for the session, not the
+# UserPromptSubmit itself: a long turn emits PreToolUse/Notification/... for
+# minutes while its UserPromptSubmit ages out, and dating the staleness clock
+# from the submit declared every such turn "stale" after 30 s — the verdict
+# then rested entirely on the TUI spinner regex, which misses shapes it has
+# never seen. Hit live: a 20-minute turn (last submit 15:29:51,
+# PreToolUse at 15:50:31) was judged idle at 15:50:32, the delivery went into
+# Claude Code's own mid-turn queue and the prompt reached Claude twice.
 # Prints "<sid>\x1f<idle|running|stale>".
 session_state() {
   python3 - "$STORE" "$1" "$EVENTS" <<'PY' 2>/dev/null
@@ -794,22 +1138,25 @@ except Exception:
 verdict = "unknown"
 if sid:
     needle = ("claude-" + sid).encode()
-    last = None
+    last = None   # newest decisive event: UserPromptSubmit or Stop
+    beat = None   # newest hook event of any kind = the session is still alive
     try:
         f = open(events, "rb")
         f.seek(0, 2)
         f.seek(max(0, f.tell() - 2097152))
         for line in f.read().splitlines():
-            if needle not in line:
-                continue
-            if b"agent.hook.UserPromptSubmit" not in line and b'"agent.hook.Stop"' not in line:
+            if needle not in line or b'"agent.hook.' not in line:
                 continue
             try:
                 e = json.loads(line)
             except Exception:
                 continue
-            if e.get("name") in ("agent.hook.UserPromptSubmit", "agent.hook.Stop") \
-               and (e.get("payload") or {}).get("session_id") == needle.decode():
+            name = e.get("name") or ""
+            if not name.startswith("agent.hook.") \
+               or (e.get("payload") or {}).get("session_id") != needle.decode():
+                continue
+            beat = e
+            if name in ("agent.hook.UserPromptSubmit", "agent.hook.Stop"):
                 last = e
     except Exception:
         pass
@@ -818,7 +1165,11 @@ if sid:
             verdict = "idle"
         else:
             try:
-                ts = datetime.datetime.fromisoformat((last.get("occurred_at") or "").replace("Z", "+00:00"))
+                # beat is never older than last (the log is append-ordered);
+                # if it somehow were, the larger age only biases toward the
+                # screen re-check, which is the safe direction
+                ts = datetime.datetime.fromisoformat(
+                    ((beat or last).get("occurred_at") or "").replace("Z", "+00:00"))
                 age = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
             except Exception:
                 age = 0
@@ -829,6 +1180,91 @@ print(sid + "\x1f" + verdict)
 PY
 }
 
+# Claude Code's transcript for a session, if it is on disk. The directory name
+# encodes the cwd, which we do not know here, so the session id is matched
+# across all of them — session ids are UUIDs, so at most one can hit.
+transcript_path() {
+  local f
+  for f in "$HOME/.claude/projects"/*/"$1.jsonl"; do
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+# Python source shared by transcript_confirm and confirm_wait: does the tail
+# of a Claude Code transcript jsonl hold a user message matching `want` at or
+# after epoch `since`? They run as two separate one-shot python processes —
+# confirm_wait must stay a single process across its whole poll loop (see
+# below), so it cannot just shell out to transcript_confirm on every retry —
+# so a plain function definition cannot be shared between them; this is
+# injected into each heredoc instead, via an env var and exec().
+IFS= read -r -d '' TRANSCRIPT_MATCH_PY <<'PYFRAG' || :
+def transcript_match(path, want, since):
+    if not path:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4194304))   # tail only: a transcript can be huge
+            chunk = f.read()
+    except Exception:
+        return False
+    needle = want.encode("utf-8", "replace")[:60]
+    for raw in chunk.split(b"\n"):
+        if needle not in raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if d.get("type") != "user":
+            continue
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = "".join(b.get("text", "") for b in c
+                           if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            continue
+        if text != want:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(
+                (d.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if ts >= since:
+            return True
+    return False
+PYFRAG
+
+# Was EXACTLY this prompt submitted to this session at or after epoch $3?
+# The timestamp bound is what makes it safe: the same text may well have been
+# sent before (a repeat is ordinary), and confirming on an older copy would
+# pop a line that never ran.
+transcript_confirm() {
+  local tf
+  tf=$(transcript_path "$1") || return 1
+  TRANSCRIPT_MATCH_PY="$TRANSCRIPT_MATCH_PY" python3 - "$tf" "$2" "$3" <<'PY' 2>/dev/null
+import datetime, json, os, sys
+exec(os.environ["TRANSCRIPT_MATCH_PY"])
+path, want, since = sys.argv[1], sys.argv[2], float(sys.argv[3])
+sys.exit(0 if transcript_match(path, want, since) else 1)
+PY
+}
+
+# Epoch seconds of a file's mtime, or 0. Used as the "not before" bound for
+# the transcript check: how long ago we typed the line.
+#
+# %Fm, not %m: whole seconds round the bound DOWN, below the marker's true
+# write instant, so a transcript entry written a few milliseconds BEFORE the
+# marker still satisfies "at or after it". The marker is rewritten right after
+# the submit it is meant to postdate, so that is the ordinary case, not a
+# rare one — and it would confirm the second copy of a deliberately repeated
+# prompt against the first copy's entry and pop it unsent.
+mtime_epoch() { /usr/bin/stat -f %Fm "$1" 2>/dev/null || echo 0; }
+
 # Did a UserPromptSubmit for this session land in events.jsonl after byte
 # offset $2? With $4 = strict, additionally require tool_input_length to match
 # the queued line (the payload redacts the prompt text but keeps the length of
@@ -836,8 +1272,22 @@ PY
 # near, allow the submit to be up to 4 bytes LONGER than the queued line: the
 # box scrape strips trailing whitespace, so a copy of the same draft submitted
 # by the TUI itself can come out slightly longer than what was scraped.
+#
+# Claude Code's own transcript is the authoritative source and is checked
+# first: cmux's tool_input_length SATURATES for long prompts. Measured
+# on three unrelated prompts of 287, 727 and 17107 characters —
+# reported 254, 253 and 263. Every prompt over roughly 250 characters is
+# therefore unidentifiable in the event log, so no long delivery could ever be
+# confirmed: the line stayed queued and went out again on every tick. Five
+# copies of one prompt reached Claude before this was found. Short prompts
+# still match exactly (49, 104, 122 verified), so the event check is kept as
+# the fallback for them and for sessions with no transcript on disk.
 confirm_submit() {
-  local sid="$1" offset="$2" line="$3" strict="${4:-loose}"
+  local sid="$1" offset="$2" line="$3" strict="${4:-loose}" since="${5:-0}"
+  transcript_confirm "$sid" "$line" "$since" && return 0
+  # a rotated event log (cmux renames it to events.jsonl.1 at 16 MB) leaves
+  # every stored offset past the end of the new file, where tail reads nothing
+  [ "$offset" -gt "$(wc -c < "$EVENTS" 2>/dev/null || echo 0)" ] 2>/dev/null && offset=0
   tail -c "+$((offset + 1))" "$EVENTS" 2>/dev/null | python3 -c '
 import json, sys
 sid, text, mode = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -872,17 +1322,35 @@ sys.exit(1)' "claude-$sid" "$line" "$strict"
 # landed — the queued line was then popped without ever running. The old
 # shell loop also spawned a fresh interpreter every 0.5 s, up to 12 per
 # delivery, each 20-300 ms of startup under load.
+#
+# $4 = the transcript to watch alongside the events (empty if there is none).
+# Long prompts are invisible in the event log — see confirm_submit — so for
+# them the transcript is the only signal that can ever fire here.
 confirm_wait() {
-  python3 - "$EVENTS" "claude-$1" "$2" "$3" <<'PY' 2>/dev/null
-import json, sys, time
+  TRANSCRIPT_MATCH_PY="$TRANSCRIPT_MATCH_PY" \
+    python3 - "$EVENTS" "claude-$1" "$2" "$3" "$(transcript_path "$1" || true)" \
+    <<'PY' 2>/dev/null
+import datetime, json, os, sys, time
+exec(os.environ["TRANSCRIPT_MATCH_PY"])
 events, sid, offset, text = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+tpath = sys.argv[5]
+# taken here rather than passed in: this runs immediately after the Enter, and
+# a shell `date +%s` would round down to the top of its second, widening the
+# window into prompts submitted before ours
+since = time.time() - 2   # slack: the two clocks are not the same
+
 lens = {len(json.dumps({"prompt": text}, separators=(",", ":"))),
         len(json.dumps({"prompt": text}, separators=(",", ":"), ensure_ascii=False))}
 deadline = time.monotonic() + 6.0
 pos = offset
 while True:
+    if transcript_match(tpath, text, since):
+        sys.exit(0)
     try:
         with open(events, "rb") as f:
+            f.seek(0, 2)
+            if f.tell() < pos:   # the log rotated under us; start over
+                pos = 0
             f.seek(pos)
             chunk = f.read()
     except Exception:
@@ -915,19 +1383,75 @@ PY
 # few milliseconds on both sides. A holder can be SIGKILLed at any line, so
 # a lock older than 5 s is stolen.
 qlock_take() {
-  local ql="$QDIR/$1.qlock" tries=0
+  local ql="$QDIR/$1.qlock" tries=0 stole=""
   until mkdir "$ql" 2>/dev/null; do
     if [ -z "$(/usr/bin/find "$ql" -newermt '-5 seconds' 2>/dev/null)" ]; then
       rm -rf "$ql"
+      stole=1
       continue
     fi
     tries=$((tries + 1))
     [ "$tries" -ge 20 ] && return 1
     sleep 0.05
   done
+  # An uncontended mkdir is atomic and needs nothing more. Breaking a stale
+  # lock is not: a second breaker removes the directory we just created and
+  # makes its own, and both proceed to rewrite the queue file at once, which
+  # is how a concurrent append disappears. Stamp and re-read, so the loser
+  # backs off. Only the crash-recovery path pays the settle.
+  if [ -n "$stole" ]; then
+    printf '%s\n' "$$" > "$ql/owner" 2>/dev/null
+    sleep 0.05
+    [ "$(cat "$ql/owner" 2>/dev/null)" = "$$" ] || return 1
+  fi
   return 0
 }
 qlock_drop() { rm -rf "$QDIR/$1.qlock"; }
+
+# Drop the head of the queue, but ONLY if it is still the line the caller
+# handled. The queue manager can delete or edit the head while a delivery is
+# in flight (it has no way to see one in progress), and an unconditional
+# `tail -n +2` would then discard whatever moved up into its place — a prompt
+# the user queued and never got. Callers already hold the qlock.
+pop_head() {  # $1 = surface, $2 = the line expected at the head
+  local qfile="$QDIR/$1.queue"
+  [ "$(head -n 1 "$qfile" 2>/dev/null)" = "$2" ] || return 1
+  tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
+}
+
+qinode() { /usr/bin/stat -f %i "$QDIR/$1.queue" 2>/dev/null; }
+
+# Is the attempt record still about the line currently at the head of the
+# queue? Both delivery guards that read it (late-confirm, in-flight) must fire
+# for the instance they were written for and for no other.
+#
+# The discriminator is the queue file's inode, recorded as line 3 of the
+# record. Every pop and every manager edit replaces the file via mv, so the
+# inode changes; every enqueue appends, so it does not. That is exactly the
+# question being asked — "has the head line been popped since this attempt?"
+# The mtime comparison it replaces could not answer it: ANY append made the
+# queue newer than the record and disarmed both guards, and queueing more
+# prompts during a long turn is this tool's main use case. Hit live: prompt A
+# sat in Claude Code's own mid-turn queue, the user queued B, and A was sent
+# to Claude a second time.
+#
+# A record from before the inode field simply does not match (line 3 is
+# empty), so an upgrade with a delivery in flight resends once instead of
+# holding off. Falling back to the old mtime test here would have kept the
+# duplicate alive for exactly the records most likely to hit it; the case is
+# already covered independently by the qoffset "already submitted since
+# enqueue" check below, which reads the event log and needs no record at all.
+attempt_live() {  # $1 = surface, $2 = current head line
+  local afile="$QDIR/$1.attempt" want
+  [ -f "$afile" ] || return 1
+  [ "$(sed -n 2p "$afile")" = "$2" ] || return 1
+  want=$(sed -n 3p "$afile")
+  [ -n "$want" ] && [ "$want" = "$(qinode "$1")" ]
+}
+attempt_write() {  # $1 = surface, $2 = events offset, $3 = line
+  { printf '%s\n' "$2"; printf '%s\n' "$3"; printf '%s\n' "$(qinode "$1")"; } \
+    > "$QDIR/$1.attempt"
+}
 
 # Replace (with $4 set) or delete (without) queue item $2 of surface $1, but
 # only if it still holds $3 — a delivery may pop or reorder the file between
@@ -967,7 +1491,8 @@ deliver_once() {
   local qfile="$QDIR/$surface.queue"
   local lock="$QDIR/$surface.lock"
   local afile="$QDIR/$surface.attempt"
-  local line box sid ctx verdict offset delivered oldpid is_slash probe
+  local line box sid ctx verdict offset delivered oldpid is_slash ghost
+  local sfile scount sprev
 
   [ -s "$qfile" ] || return 0
 
@@ -983,6 +1508,13 @@ deliver_once() {
     fi
     rm -rf "$lock"
     ln -s "$$" "$lock" 2>/dev/null || return 1
+    # Reclaiming a stale lock is NOT atomic. A second recoverer that saw the
+    # same dead owner deletes the lock we just made and puts its own there,
+    # and both then believe they hold it — two deliverers typing the same
+    # line into the same surface. Settle and confirm ownership; the loser
+    # waits for the next tick. Only the crash-recovery path pays this.
+    sleep 0.05
+    [ "$(readlink "$lock" 2>/dev/null)" = "$$" ] || return 1
   fi
   # no RETURN trap here: it would fire on every nested function return; a stale
   # lock after a crash is recovered by the pid-liveness check above
@@ -992,6 +1524,14 @@ deliver_once() {
   # its unseen successor (duplicate + loss)
   line=$(head -n 1 "$qfile" 2>/dev/null || true)
   [ -z "$line" ] && { rm -rf "$lock"; return 0; }
+
+  # parked by the send ceiling below: this exact line is not to be typed again
+  if [ -f "$QDIR/$surface.parked" ]; then
+    if [ "$(sed -n 1p "$QDIR/$surface.parked")" = "$line" ]; then
+      rm -rf "$lock"; return 1
+    fi
+    rm -f "$QDIR/$surface.parked"   # the head moved on
+  fi
 
   # Slash commands (/compact, /clear, skill invocations...) are handled inside
   # the Claude Code TUI and emit no UserPromptSubmit event, so the event-log
@@ -1026,14 +1566,14 @@ deliver_once() {
   # text and must be sent normally, not swallowed by an old confirmation.
   # For a slash command the record alone is trusted — no event will ever
   # exist, and the record is only written after the box-cleared confirmation.
-  if [ -n "$sid" ] && [ -f "$afile" ] && [ "$afile" -nt "$qfile" ] \
-     && [ "$(sed -n 2p "$afile")" = "$line" ] \
+  if [ -n "$sid" ] && attempt_live "$surface" "$line" \
      && { [ -n "$is_slash" ] \
-          || confirm_submit "$sid" "$(sed -n 1p "$afile")" "$line" strict; }; then
+          || confirm_submit "$sid" "$(sed -n 1p "$afile")" "$line" strict \
+                            "$(mtime_epoch "$afile")"; }; then
     log "deliver surface=$surface late-confirmed, not resending: $line"
     if qlock_take "$surface"; then
-      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
-        && rm -f "$afile"
+      pop_head "$surface" "$line" \
+        && rm -f "$afile" "$QDIR/$surface.sends" "$QDIR/$surface.parked"
       wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
@@ -1047,10 +1587,12 @@ deliver_once() {
   # scraped copy would then go out a second time. If a near-matching submit
   # landed since this queue became non-empty, pop instead of resending.
   qoff=$(cat "$QDIR/$surface.qoffset" 2>/dev/null)
-  if [ -n "$qoff" ] && confirm_submit "$sid" "$qoff" "$line" near; then
+  if [ -n "$qoff" ] && confirm_submit "$sid" "$qoff" "$line" near \
+                                      "$(mtime_epoch "$QDIR/$surface.qoffset")"; then
     log "deliver surface=$surface already submitted since enqueue, popping without resend: $line"
     if qlock_take "$surface"; then
-      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
+      pop_head "$surface" "$line"
+      rm -f "$QDIR/$surface.sends" "$QDIR/$surface.parked"
       wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
@@ -1078,29 +1620,80 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   esac
 
   # never clobber a draft the user is typing
+  ghost=""
   box=$(read_box "$surface")
   if [ -n "$box" ] && [ "$box" != "$line" ]; then
-    # Claude Code's ghost-text prompt suggestion scrapes exactly like a typed
-    # draft (same ❯ prefix; no style attribute survives read-screen) and
-    # would hold delivery off forever (hit live). Ghost text is display-only
-    # over an EMPTY buffer: after typing one char the box holds just that
-    # char, while a real draft holds draft+char. The backspace undoes the
-    # probe in both cases (a suggestion simply re-renders on an empty box).
-    # Only reached when the session is idle, so the probe cannot steer a
-    # running turn.
-    probe=""
-    if "$CMUX_BIN" send --surface "$surface" "x" >>"$QDIR/log.txt" 2>&1; then
-      sleep 0.3
-      probe=$(read_box "$surface")
-      "$CMUX_BIN" send-key --surface "$surface" backspace >>"$QDIR/log.txt" 2>&1
-    fi
-    if [ "$probe" != "x" ]; then
+    if ! box_is_ghost "$surface"; then
       log "deliver surface=$surface holding off, user draft in box"
       rm -rf "$lock"
       return 1
     fi
     log "deliver surface=$surface box content is a ghost suggestion, proceeding"
+    # remember it: a suggestion sits over an EMPTY buffer, and every later
+    # "does the box still hold our line?" test must read it as empty. Claude
+    # Code suggests the previous prompt, which after a delivery is our own
+    # line — read literally, that says "the keys never landed", and the line
+    # goes out again. Every 15 s (hit live, five copies).
+    ghost=1
   fi
+
+  # A submit already in flight. Our previous attempt typed this exact line and
+  # the box no longer holds it, yet no matching UserPromptSubmit has landed.
+  # From outside, that is exactly what Claude Code's OWN mid-turn queue looks
+  # like: it accepts the Enter and emits no hook at all until it drains at the
+  # end of the turn (measured 59 s on a live session, against a 6 s confirm
+  # window). Sending again here is how one prompt reaches Claude twice — hit
+  # live, the same line submitted at 15:56:02 and 15:56:03. Hold off instead
+  # and let the late-confirm path above pop it once the event finally lands.
+  # The age bound is the escape hatch: if no event has appeared in ten minutes
+  # the keystrokes really are gone, and a resend (with its strike) is right.
+  if [ -n "$sid" ] && attempt_live "$surface" "$line" \
+     && [ -n "$(/usr/bin/find "$afile" -newermt '-10 minutes' 2>/dev/null)" ]; then
+    box=$(read_box "$surface")
+    [ -n "$ghost" ] && box=""
+    case "$box" in
+      "$line"*)
+        # The box shows our line — but Claude Code suggests the prompt it just
+        # accepted, so this is exactly what a delivered line looks like too.
+        # Taken literally it reads as "the keys never landed" and the line
+        # goes out again on every tick, forever. Probe before believing it.
+        if box_is_ghost "$surface"; then
+          log "deliver surface=$surface box shows a suggestion of our own line, submit in flight, not resending: $line"
+          rm -rf "$lock"
+          return 1
+        fi ;;      # a real draft holding our text: the keys never landed
+      *)
+        log "deliver surface=$surface submit in flight (accepted, no event yet), not resending: $line"
+        rm -rf "$lock"
+        return 1 ;;
+    esac
+  fi
+
+  # Hard ceiling on how many times ONE line may ever be typed into a session,
+  # counted here — at the only place keys go out — and independent of every
+  # confirmation heuristic above. Those heuristics have now failed twice in
+  # ways nobody predicted (a mid-turn queue that emits no event; a prompt too
+  # long for cmux to report a usable length), and each time the result was the
+  # same prompt delivered over and over. Whatever the next surprise is, it
+  # stops here. Parking, not dropping: the line stays queued and visible, and
+  # the user decides — losing a prompt is as unacceptable as repeating one.
+  sfile="$QDIR/$surface.sends"
+  scount=1
+  if [ -f "$sfile" ] && [ "$(sed -n 2p "$sfile")" = "$line" ]; then
+    sprev=$(sed -n 1p "$sfile")
+    case "$sprev" in *[!0-9]*|'') sprev=0 ;; esac
+    scount=$((sprev + 1))
+  fi
+  if [ "$scount" -gt 3 ]; then
+    printf '%s\n' "$line" > "$QDIR/$surface.parked"
+    log "deliver surface=$surface PARKED after 3 sends without confirmation, not sending again: $line"
+    "$CMUX_BIN" notify --title "Queue paused" \
+      --body "A queued prompt was sent 3x without confirmation. It is still queued; check the session." \
+      --surface "$surface" >/dev/null 2>&1
+    rm -rf "$lock"
+    return 1
+  fi
+  { printf '%s\n' "$scount"; printf '%s\n' "$line"; } > "$sfile"
 
   offset=$(wc -c < "$EVENTS" 2>/dev/null || echo 0)
   "$CMUX_BIN" send --surface "$surface" $'\x15' >>"$QDIR/log.txt" 2>&1 || {
@@ -1137,7 +1730,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
       if [ "$dcount" -ge 3 ]; then
         log "deliver surface=$surface parked after $dcount diverges, text left in box: $line"
         if qlock_take "$surface"; then
-          tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile"
+          pop_head "$surface" "$line"
           wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
           qlock_drop "$surface"
         fi
@@ -1175,11 +1768,12 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     # on any line, and a confirmed-but-not-popped line would be re-sent as a
     # duplicate prompt. With the record, the next tick takes the late-confirm
     # path above and pops without resending.
-    rm -f "$QDIR/$surface.diverge" "$QDIR/$surface.resend"
-    { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
+    rm -f "$QDIR/$surface.diverge" "$QDIR/$surface.resend" \
+          "$QDIR/$surface.sends" "$QDIR/$surface.parked"
+    attempt_write "$surface" "$offset" "$line"
     if qlock_take "$surface"; then
-      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
-        || log "deliver surface=$surface pop failed, next tick will late-confirm"
+      pop_head "$surface" "$line" \
+        || log "deliver surface=$surface pop failed or head changed, next tick will late-confirm"
       # advance the enqueue offset past our own submit, so an identical line
       # queued next (intentional repeat) is not swallowed as already-sent
       wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
@@ -1196,7 +1790,28 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   # trusts the record without an event — so for them it may only ever be
   # written by the confirmed branch above, never on a failed attempt
   if [ -z "$is_slash" ]; then
-    { printf '%s\n' "$offset"; printf '%s\n' "$line"; } > "$afile"
+    attempt_write "$surface" "$offset" "$line"
+    # Modern Claude Code has its OWN mid-turn queue: a submit that lands in it
+    # fires no UserPromptSubmit until that queue drains at the end of the turn
+    # — measured 59 s on a live session, against a 6 s confirm window. So an
+    # unconfirmed send does not mean the keystrokes were lost. If our text is
+    # gone from the box, the TUI has it, and a strike here would be unearned:
+    # three of those drop a prompt the user really did send. Keep the line for
+    # the late-confirm path, but do not count it against the cap. (Slash
+    # commands already confirm this way; this is the same signal.)
+    box=$(read_box "$surface")
+    case "$box" in
+      # a suggestion of the line we just sent looks identical to the line
+      # never having been taken; only the probe tells them apart
+      "$line"*) box_is_ghost "$surface" && box="" ;;
+    esac
+    case "$box" in
+      "$line"*) : ;;   # still sitting there: Enter genuinely did not land
+      *)
+        log "deliver surface=$surface box no longer holds it, TUI accepted it (native queue) — no strike"
+        rm -rf "$lock"
+        return 1 ;;
+    esac
   fi
   # Resend cap: a line that can never be confirmed must not be resubmitted
   # forever (the /compact loop was exactly that, before slash detection).
@@ -1213,7 +1828,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   if [ "$rcount" -ge 3 ]; then
     log "deliver surface=$surface dropped after $rcount unconfirmed sends: $line"
     if qlock_take "$surface"; then
-      tail -n +2 "$qfile" > "$qfile.tmp" 2>/dev/null && mv "$qfile.tmp" "$qfile" \
+      pop_head "$surface" "$line" \
         && rm -f "$rfile"
       wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
@@ -1234,7 +1849,7 @@ case "$cmd" in
   capture)
     # Instant statusline feedback: mark a capture in flight before any of the
     # slow socket work. While this file is fresh the statusline shows a
-    # transient "⏳ Queue: …" row, which turns into the real queued row once
+    # transient "⏳ Queuing…" row, which turns into the real queued row once
     # the draft lands in a queue file. Removed on every exit path (trap),
     # with a short mtime TTL in the statusline as the crash guard.
     cstamp="$QDIR/capturing.stamp"
@@ -1359,13 +1974,36 @@ print(json.dumps(d))' 2>/dev/null) || out=""
       *) printf '%s' "$payload" ;;
     esac
     exec >>"$QDIR/log.txt" 2>&1  # anything after this must not touch stdout
+    shopt -s nullglob
+    # Orphan spool sweep. The hotkey daemon spools a draft and clears the box
+    # BEFORE handing off, so a handler that never spawned (or died early) left
+    # the only copy of that draft on disk — recovery therefore runs BEFORE the
+    # housekeeping delete below, or a long-orphaned draft (cmux closed, so no
+    # notification ever fired) would be swept away instead of replayed.
+    # Anything under 5 s old is a live handoff and is left alone. Nothing
+    # usually matches, so the glob is the whole cost on the common path.
+    seen=""
+    swept=$SECONDS
+    for sf in "$QDIR"/*.spool; do
+      [ -n "$(/usr/bin/find "$sf" -newermt '-5 seconds' 2>/dev/null)" ] && continue
+      sb=$(basename "$sf"); sb=${sb%.*.spool}
+      case " $seen " in *" $sb "*) continue ;; esac
+      seen="$seen $sb"
+      log "notifyhook: recovering orphaned spool for surface=$sb"
+      "$0" spool "$sb" >/dev/null 2>&1
+      # cmux blocks on this hook: leave the rest for the next notification
+      [ $((SECONDS - swept)) -ge 2 ] && break
+    done
     # housekeeping: surface ids regenerate on every cmux restart, so drained
     # queues, old markers and stale stamps would otherwise accumulate forever
-    # (and slow the glob every statusline refresh pays)
+    # (and slow the glob every statusline refresh pays). The spool patterns are
+    # a last-resort backstop only — the sweep above consumes every spool it can
+    # parse, so anything reaching this line is unreadable or unroutable.
     /usr/bin/find "$QDIR" \( \( -name '*.queue' -size 0 \) -o -name '*.attempt' \
       -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' \
-      -o -name '*.diverge' -o -name '*.resend' -o -name 'sidmap-*' \) -mtime +1 -delete 2>/dev/null
-    shopt -s nullglob
+      -o -name '*.diverge' -o -name '*.resend' -o -name 'sidmap-*' \
+      -o -name '*.sends' -o -name '*.parked' \
+      -o -name '*.spool' -o -name '*.spool.tmp' \) -mtime +1 -delete 2>/dev/null
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue
       # at most one real keystroke delivery per tick, to stay inside the hook

@@ -6,7 +6,7 @@ Claude Code has no native message queue: anything you type while a turn is runni
 
 `cmux-claude-queue` fixes that at the terminal level. Type your next prompt into the Claude Code input box as usual and press **Opt+Enter**:
 
-- a quiet "Pop" confirms the press instantly, and the statusline shows `⏳ Queue: …` within about a second,
+- the box empties within milliseconds, a quiet "Pop" confirms the press, and the statusline shows `⏳ Queuing…` until the real `⏳ Queue: …` row takes over about a second later,
 - the draft — all of it, multi-line included — disappears from the input box a couple hundred milliseconds after the press, before Claude ever sees it, and fills in the queue row,
 - and the moment the current turn ends it is submitted as a fresh, ordinary prompt.
 
@@ -22,23 +22,27 @@ Claude Code cannot intercept mid-turn input (messages typed while a turn runs by
 Opt+Enter
    │
    ▼
-hotkeyd ──spawns──▶ capture ──Ctrl+U──▶ input box cleared
- (Carbon hotkey,       │
-  cmux frontmost       └──▶ ~/.claude/prompt-queue/<surfaceId>.queue
-  only)                            │
-                                   ├──▶ statusline row "⏳ Queue: …"
-                                   │       (+ retry tick while non-empty)
-                                   ▼
-                            notifyhook (cmux notification hook)
-                                   │  turn ended? draft box empty?
-                                   ▼
-                            types the text + Enter, then confirms
-                            the submit in cmux's event log before
-                            removing it from the queue
+hotkeyd ──warm socket──▶ read box ─▶ <surfaceId>.<ms>.spool ─▶ box cleared
+ (Carbon hotkey,          (in-process, no spawn — ~10 ms to here)     │
+  cmux frontmost                                                     │
+  only)                                                              ▼
+                                            spool ──▶ ~/.claude/prompt-queue/<surfaceId>.queue
+                                         (spawned)              │
+                                                                ├──▶ statusline row "⏳ Queue: …"
+                                                                │       (+ retry tick while non-empty)
+                                                                ▼
+                                                         notifyhook (cmux notification hook)
+                                                                │  turn ended? draft box empty?
+                                                                ▼
+                                                         types the text + Enter, then confirms
+                                                         the submit in cmux's event log before
+                                                         removing it from the queue
 ```
 
-- **`hotkeyd/main.swift`** — a ~130-line daemon. Registers Opt+Return (capture) and Opt+Shift+Return (queue manager) as system hotkeys via Carbon `RegisterEventHotKey` *only while cmux is the frontmost app* (no Accessibility permission needed). In every other app both combos behave normally. It plays a quiet "Pop" the instant the capture hotkey fires — the capture takes up to a second on a busy machine, and the sound confirms the press was heard before anything visible happens (`touch ~/.config/cmux-claude-queue/no-sound` to disable).
-- **`capture`** — finds the Claude session in the focused cmux workspace, scrapes the draft off the terminal screen, clears the whole box (multi-line drafts included, verified against a re-read), appends the draft to a per-surface queue file. Idle session: just presses Enter instead. The whole sequence talks to cmux's control socket directly (~2 ms per request instead of ~140 ms per cmux CLI spawn), so the box empties roughly 150 ms after the keypress; the CLI-based path remains as an automatic fallback. A marker file — stamped by the daemon at the keypress itself — additionally makes the statusline show a transient `⏳ Queue: …` placeholder until the real queue row takes over.
+- **`hotkeyd/main.swift`** — the daemon. Registers Opt+Return (capture) and Opt+Shift+Return (queue manager) as system hotkeys via Carbon `RegisterEventHotKey` *only while cmux is the frontmost app* (no Accessibility permission needed). In every other app both combos behave normally. It also performs the capture itself, in-process, over one warm authenticated control-socket connection: resolve the target session, read the box, spool the draft, clear the box. Spawning a helper for that used to cost 100–500 ms of `fork`/`exec` plus interpreter startup before anything visible happened, which no amount of optimizing inside the helper could fix. It plays a quiet "Pop" the instant the hotkey fires (`touch ~/.config/cmux-claude-queue/no-sound` to disable), and `touch ~/.config/cmux-claude-queue/no-fastpath` forces every capture back through the spawned script.
+- **`spool`** — the deferred half of that capture, spawned once the box is already clear. It parses the spooled screen dump (the width-aware join that reconstructs a wrapped draft stays here, not in Swift), drops double-press duplicates, appends to the queue file, verifies the clear landed and nudges delivery. None of it is on the path the user waits for.
+- **`capture`** — the same sequence as a standalone process, used from the Command Palette and as the daemon's automatic fallback whenever the socket is unavailable, auth is refused, or the screen does not parse. It talks to the control socket directly too, with a cmux-CLI path behind that.
+- The draft is written to its spool file **before** the first clear keystroke goes out, so a crash, a failed spawn or a dead handler can never destroy it — worst case it sits on disk and the next notification (or statusline refresh) replays it. A marker file stamped at the keypress itself makes the statusline show a transient `⏳ Queuing…` placeholder until the real queue row takes over.
 - **`statusline`** — a Claude Code `statusLine` wrapper. Serves your previous statusline command (if any) stale-while-revalidate: its last output comes from a per-session cache instantly and a detached background job refreshes the cache when it is older than 10 s, so the wrapper never blocks on an expensive chain (Claude Code kills statusline commands that outlive the refresh interval). It appends the queue row and doubles as a delivery pump: pressing Esc kills a turn without emitting any event, so the periodic statusline refresh fires an invisible retry notification while the queue is non-empty.
 - **`notifyhook`** — a cmux notification hook. On every notification (turn complete, or a retry tick) it checks per session whether the turn is really over, types the queued text into the input box and presses Enter, then waits for the matching `UserPromptSubmit` event in cmux's event log before removing the item from the queue. It backs off if you have a new draft in the box, and never injects into a running turn.
 
@@ -83,17 +87,18 @@ With that in place (for sessions started after the change), pressing **Ctrl+G du
 
 The tool is built to be invisible on a busy machine — everything is event-driven, nothing polls:
 
-- The hotkey daemon sits at 0% CPU (Carbon hotkey + app-activation callbacks, no event tap, no timers) and ~30 MB RSS.
+- The hotkey daemon sits at 0% CPU (Carbon hotkey + app-activation callbacks, no event tap, no timers) and ~25 MB RSS — unchanged by moving the capture in-process, which is the whole reason it lives there rather than in a second resident helper.
 - The statusline wrapper's hot path is bash builtins almost end to end: the payload is parsed with substring expansion (no JSON tool), the session→surface lookup is a one-line cached file read, and freshness checks hide behind `[ -f ]` guards. A run costs roughly half of what it did when every refresh paid two `plutil` spawns, which is what makes the 1 s refresh interval a net-zero change in total load. An interpreter is spawned only in the one session that owns a non-empty queue.
 - The chained statusline never runs in the foreground: its output is served from a per-session cache (stale-while-revalidate, 10 s TTL, refreshed by a detached background job), so the wrapper finishes in tens of milliseconds regardless of what the chain costs. With many sessions open this makes the tool *reduce* total statusline load compared to a plain 5 s cadence, while the queue row still appears within ~1 s of a capture.
-- The capture hot path (hotkey → box cleared) is one Python process speaking cmux's control socket directly: auth, workspace lookup, screen read, queue append and the box clear are ~10 ms of socket round-trips (measured ~2 ms per request), roughly 150 ms end to end including interpreter startup and a redraw-verified clear. The previous CLI-based sequence cost ~140 ms per `cmux` spawn, three spawns serially, and it remains in place as the automatic fallback when the socket is unavailable.
+- The capture hot path (hotkey → box cleared) creates no processes at all. The already-resident daemon holds one warm authenticated socket, so the whole sequence is a handful of round-trips: measured ~5 ms for the workspace lookup, ~1.2 ms per screen read, ~1 ms for the clear, against 3.9 ms of one-time connect and auth. That is single-digit milliseconds and, more importantly, it does not degrade under load — the 100–500 ms this used to spend on `fork`/`exec` and interpreter startup was invisible in any in-process measurement and dominated the real experience. Parsing, queueing and clear verification happen afterwards in a spawned helper, where their cost is not felt.
+- Everything the daemon adds is in-process: one socket fd and a few hundred bytes of state, no second resident interpreter and nothing per-surface, so many open sessions cost the same as one.
 - The notification hook answers cmux with a pure-bash passthrough for every foreign notification, so it never delays your notifications; JSON rewriting runs only for the tool's own invisible retry ticks.
 - Delivery attempts are triggered by turn-complete notifications and by the statusline retry tick (rate-limited to one per 15 s, and only while a queue is non-empty). With empty queues the tool does no periodic work at all.
 
 ## Safety properties
 
-- A queued prompt is only submitted when the session is idle; the running turn never sees it. Turn state is decided from cmux's Claude hook events, with an on-screen spinner check as the tiebreaker (covers Esc-interrupted turns, which emit no event at all).
-- Delivery is confirmed against cmux's event log (session id + exact prompt length) before the item leaves the queue; unconfirmed sends are retried, and a late-arriving submit is detected instead of re-sent (no duplicates). Slash commands (`/compact`, `/clear`, skills…) run inside the Claude Code TUI and emit no submit event, so they are confirmed by the input box clearing instead. As a backstop, a line still unconfirmed after three full sends is dropped with a notification (and kept in the log) rather than resubmitted forever.
+- A queued prompt is only submitted when the session is idle; the running turn never sees it. Turn state is decided from cmux's Claude hook events: a turn counts as running until its `Stop`, and *any* hook event for the session (a tool call, a permission request…) is proof it is still alive, so an hour-long turn stays running for as long as it keeps emitting. Only a session that has gone completely silent for 30 s falls back to the on-screen spinner check, which is what covers Esc-interrupted turns (they emit no event at all).
+- Delivery is confirmed against cmux's event log (session id + exact prompt length) before the item leaves the queue; unconfirmed sends are retried, and a late-arriving submit is detected instead of re-sent (no duplicates). Modern Claude Code has its own mid-turn queue that swallows a submit and emits no event until the turn ends, so a send whose text left the input box is treated as in flight: it is neither re-sent nor counted against the retry cap until the event finally lands. Slash commands (`/compact`, `/clear`, skills…) run inside the Claude Code TUI and emit no submit event, so they are confirmed by the input box clearing instead. As a backstop, a line still unconfirmed after three full sends is dropped with a notification (and kept in the log) rather than resubmitted forever.
 - Delivery is crash-safe against the process being killed mid-flight (cmux reaps notification-hook processes when their notification clears): the confirmed submit is recorded *before* the item is popped, so if the pop never lands the next tick recognizes the recorded submit and pops without resending.
 - If you start typing a new draft while something is queued, delivery backs off until the box is free — your draft is never overwritten. Claude Code's ghost-text prompt suggestions scrape identically to a typed draft, so they are told apart by a reversible one-key probe (a suggestion sits over an empty input buffer, a draft does not) and never block delivery.
 - A nervous double Opt+Enter cannot enqueue the draft twice: the second capture can race the box clear and scrape the same text again, so an identical line captured within 3 s is dropped. Deliberately re-queueing the same prompt later still works.
