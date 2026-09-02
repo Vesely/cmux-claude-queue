@@ -29,6 +29,10 @@ let captureScript: String = CommandLine.arguments.count > 1
 // (three serial cmux socket calls), during which nothing visible happens yet.
 // Touch this file to disable the sound.
 let soundOptOutPath = ("~/.config/cmux-claude-queue/no-sound" as NSString).expandingTildeInPath
+// Written at the keypress itself so the statusline placeholder row can render
+// on its very next refresh; under load the capture process takes 100-500 ms
+// to even start, and its own touch would miss that first refresh.
+let captureStampPath = ("~/.claude/prompt-queue/capturing.stamp" as NSString).expandingTildeInPath
 
 private struct Hotkey {
     let id: UInt32
@@ -106,6 +110,12 @@ final class HotkeyDaemon {
             let sound = NSSound(named: "Pop")
             sound?.volume = 0.5
             sound?.play()
+        }
+        if hk.action == "capture" {
+            // the capture script re-touches, renames and finally removes this
+            // stamp; a spawn failure below leaves it behind, which the
+            // statusline cleans up once it goes stale
+            FileManager.default.createFile(atPath: captureStampPath, contents: nil)
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: captureScript)

@@ -85,7 +85,7 @@ echo '   "statusLine": {'
 echo '     "type": "command",'
 echo "     \"command\": \"$BIN_DIR/cmux-claude-queue statusline\","
 echo '     "padding": 0,'
-echo '     "refreshInterval": 2'
+echo '     "refreshInterval": 1'
 echo '   }'
 echo
 echo "If you already had a statusLine command, save it as a shell script at"

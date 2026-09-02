@@ -817,13 +817,47 @@ case "$cmd" in
     # that gets the statusline JSON on stdin); run it first and print its
     # output untouched, then append one row with this session's pending queue.
     # Empty queue = no extra row, the statusline shrinks back automatically.
-    payload=$(cat)
+    # builtin read instead of a cat spawn (hot path, see below); -d '' reads
+    # to EOF and preserves inner newlines, the rc=1 at EOF is expected
+    payload=""
+    IFS= read -r -d '' payload || :
     chain="$HOME/.config/cmux-claude-queue/statusline-chain"
-    sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null)
+    # This is the hottest path in the whole tool: every open session runs it
+    # on every refresh. session_id is a UUID in flat JSON, so a bash substring
+    # replaces a plutil spawn; plutil stays as the fallback for any shape the
+    # substring does not recognize.
+    sid=${payload#*\"session_id\"}
+    if [ "$sid" = "$payload" ]; then
+      sid=""
+    else
+      sid=${sid#*\"}; sid=${sid%%\"*}
+    fi
+    case "$sid" in
+      *[!0-9a-fA-F-]*|'')
+        sid=$(printf '%s' "$payload" | plutil -extract session_id raw -o - -- - 2>/dev/null) ;;
+    esac
+    # opt-in refresh-cadence tracing: create the flag file to log one line
+    # per wrapper run; costs a single builtin test when absent
+    [ -f "$QDIR/debug-cadence" ] \
+      && printf '%s %s\n' "$(date '+%s')" "$sid" >> "$QDIR/debug-cadence" 2>/dev/null
+    # The sid -> surface mapping is stable for the life of a session binding,
+    # so it is cached in a file and read with a builtin instead of two plutil
+    # spawns per refresh. The cache is re-validated from the store below
+    # whenever a row might actually render (some queue is pending) — a cmux
+    # restart rebinds a resumed session to a new surface id while the sid
+    # persists, and a stale "not mine" must never hide a pending row.
+    resolve_surf() {
+      surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
+        || surf=$(plutil -extract "sessions.claude-$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
+        || surf=""
+      [ -n "$surf" ] && printf '%s\n' "$surf" > "$QDIR/sidmap-$sid"
+    }
     surf=""
     if [ -n "$sid" ]; then
-      surf=$(plutil -extract "sessions.$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null) \
-        || surf=$(plutil -extract "sessions.claude-$sid.surfaceId" raw -o - -- "$STORE" 2>/dev/null)
+      if [ -f "$QDIR/sidmap-$sid" ]; then
+        IFS= read -r surf < "$QDIR/sidmap-$sid" 2>/dev/null || surf=""
+      fi
+      [ -z "$surf" ] && resolve_surf
     fi
     if [ -f "$chain" ]; then
       # The chained statusline is the expensive part (user HUDs tend to run
@@ -843,7 +877,8 @@ case "$cmd" in
         base=$(printf '%s' "$payload" | /bin/sh "$chain" 2>/dev/null) || base=""
         [ -n "$base" ] && printf '%s\n' "$base"
       else
-        [ -s "$cache" ] && cat "$cache"
+        # $(<file) forks but does not exec — measurably cheaper than cat here
+        if [ -s "$cache" ]; then printf '%s\n' "$(<"$cache")"; fi
         guard="$cache.bg"
         if [ -z "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ] \
            && [ -z "$(/usr/bin/find "$guard" -newermt '-30 seconds' 2>/dev/null)" ]; then
@@ -878,12 +913,32 @@ case "$cmd" in
     fi
     # a capture is in flight (hotkey pressed, box not read/enqueued yet):
     # show the queue row with a placeholder so feedback is one refresh away.
-    # The global stamp exists only during target resolution (~0.3 s, short
-    # TTL so unrelated sessions barely flash it); after that the capture
-    # renames it per-surface and only the captured session's row shows it.
-    if [ -n "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-2 seconds' 2>/dev/null)" ] \
-       || { [ -n "$surf" ] \
-            && [ -n "$(/usr/bin/find "$QDIR/capturing-$surf.stamp" -newermt '-6 seconds' 2>/dev/null)" ]; }; then
+    # The global stamp is pre-touched by the hotkey daemon at the keypress
+    # itself and exists only until target resolution (~0.3 s, short TTL so
+    # unrelated sessions barely flash it); after that the capture renames it
+    # per-surface and only the captured session's row shows it. The [ -f ]
+    # guards keep the find spawns off the common no-capture path, and once
+    # the queue file has content the real row below replaces the placeholder.
+    show_ph=""
+    if [ -f "$QDIR/capturing.stamp" ]; then
+      if [ -n "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-2 seconds' 2>/dev/null)" ]; then
+        show_ph=1
+      elif [ -z "$(/usr/bin/find "$QDIR/capturing.stamp" -newermt '-60 seconds' 2>/dev/null)" ]; then
+        # the hotkey daemon pre-touches this stamp at the keypress; if the
+        # capture never spawned, nothing else would ever remove it (a live
+        # capture owns it for at most a few seconds, so 60 s = orphan)
+        rm -f "$QDIR/capturing.stamp"
+      fi
+    fi
+    if [ -z "$show_ph" ] && [ -n "$surf" ] && [ -f "$QDIR/capturing-$surf.stamp" ]; then
+      if [ -n "$(/usr/bin/find "$QDIR/capturing-$surf.stamp" -newermt '-6 seconds' 2>/dev/null)" ]; then
+        show_ph=1
+      else
+        # a crashed capture's leftover: drop it so it stops costing a find
+        rm -f "$QDIR/capturing-$surf.stamp"
+      fi
+    fi
+    if [ -n "$show_ph" ] && { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; }; then
       printf '\033[33m⏳ Queue:\033[0m \033[2m…\033[0m\n'
     fi
     # cheap out: no queue file with content anywhere -> skip the lookup
@@ -892,6 +947,24 @@ case "$cmd" in
       [ -s "$qf" ] && { pending=1; break; }
     done
     [ -z "$pending" ] && exit 0
+    # some queue IS pending: never trust the cached mapping to say "not
+    # mine" — re-resolve from the store (see resolve_surf above), but at most
+    # every 30 s: a queue orphaned by a cmux restart can pend for days, and
+    # unthrottled this would cost two plutil spawns per refresh in EVERY open
+    # session for as long as it does. A store miss keeps the cached value
+    # (better a possibly stale row than a blinking one) and is throttled the
+    # same way.
+    if [ -n "$sid" ]; then
+      if [ ! -f "$QDIR/sidmap-$sid" ] \
+         || [ -z "$(/usr/bin/find "$QDIR/sidmap-$sid" -newermt '-30 seconds' 2>/dev/null)" ]; then
+        prev_surf=$surf
+        resolve_surf
+        if [ -z "$surf" ]; then
+          surf=$prev_surf
+          [ -f "$QDIR/sidmap-$sid" ] && touch "$QDIR/sidmap-$sid" 2>/dev/null
+        fi
+      fi
+    fi
     # a python only runs below, in the one session that actually owns a
     # pending queue — not in every session that refreshes while some queue
     # is waiting
@@ -954,7 +1027,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # (and slow the glob every statusline refresh pays)
     /usr/bin/find "$QDIR" \( \( -name '*.queue' -size 0 \) -o -name '*.attempt' \
       -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' \
-      -o -name '*.diverge' -o -name '*.resend' \) -mtime +1 -delete 2>/dev/null
+      -o -name '*.diverge' -o -name '*.resend' -o -name 'sidmap-*' \) -mtime +1 -delete 2>/dev/null
     shopt -s nullglob
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue
