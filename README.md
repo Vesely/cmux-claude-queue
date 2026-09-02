@@ -65,6 +65,15 @@ The installer copies `bin/cmux-claude-queue` into `~/.local/bin` (re-run it afte
 
 If you already had a `statusLine` command, save it as a small shell script at `~/.config/cmux-claude-queue/statusline-chain` (it receives the statusline JSON on stdin); its output stays on top and the queue row is appended below. The chain runs only in a detached background job that refreshes a per-session cache every ~10 s, so the short refresh interval makes the queue row show up fast while your own statusline runs *less* often than the usual 5 s cadence — and a slow statusline can no longer be killed mid-run by the refresh cycle.
 
+## External-editor capture (optional)
+
+Claude Code's Ctrl+G (`chat:externalEditor`) writes the current draft to a temp file, opens `$EDITOR` on it and restores the box from the file when the editor exits. Pointing that at the queue turns Ctrl+G into a second, even higher-fidelity capture gesture:
+
+1. Add to `~/.claude/settings.json`: `"env": { "EDITOR": "~/.local/bin/cmux-claude-queue-editor" }` (expanded path).
+2. Save your actual editor command for passthrough: `echo "zed" > ~/.config/cmux-claude-queue/real-editor`.
+
+With that in place (for sessions started after the change), pressing **Ctrl+G during a running turn** queues the draft *exactly as typed* — real newlines and blank lines included (the screen scrape cannot see those), no scrape at all — and the box clears natively, since the TUI itself restores it from the emptied file. Pressing **Ctrl+G on an idle session** passes through to your real editor, exactly like vanilla Claude Code; so does every non-prompt use of `$EDITOR` inside a session (e.g. `git commit` from `!` bash mode). Note: queued prompts are still stored one per line, so the preserved newlines are currently joined for delivery.
+
 ## Extras
 
 - **`extras/qq`** — queue a prompt from Claude Code's `!` bash mode instead of the hotkey: `!qq fix the tests next`. Works mid-turn; the text is enqueued and delivered after the turn ends. Copy it into `~/.local/bin` if you want it. Caveat: the shell parses the text first, so unbalanced quotes, `$` or backticks will not survive.
@@ -102,6 +111,7 @@ The tool is built to be invisible on a busy machine — everything is event-driv
 launchctl bootout gui/$(id -u)/com.cmux-claude-queue.hotkeyd
 rm ~/Library/LaunchAgents/com.cmux-claude-queue.hotkeyd.plist
 rm ~/.local/bin/cmux-claude-queue ~/.local/bin/cmux-claude-queue-hotkeyd
+rm -f ~/.local/bin/cmux-claude-queue-editor
 rm -rf ~/.claude/prompt-queue ~/.config/cmux-claude-queue
 ```
 
