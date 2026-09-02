@@ -1,15 +1,17 @@
-// cmux-claude-queue-hotkeyd: global Opt+Return hotkey scoped to supported terminals.
+// cmux-claude-queue-hotkeyd: global hotkeys scoped to supported terminals.
 //
-// While a supported terminal (cmux) is the frontmost app, Opt+Return is
-// registered as a system hotkey and runs `cmux-claude-queue capture` directly:
-// no action tab, no focus change. In every other app the hotkey is
-// unregistered, so Opt+Return behaves normally there.
+// While a supported terminal (cmux) is the frontmost app, two system hotkeys
+// are registered:
+//   Opt+Return        -> `cmux-claude-queue capture`      (queue the draft)
+//   Opt+Shift+Return  -> `cmux-claude-queue manage-open`  (queue manager pane)
+// No action tab, no focus change. In every other app both combos are
+// unregistered, so they behave normally there.
 //
 // Uses Carbon RegisterEventHotKey, so no accessibility permission is needed;
 // the system consumes the keystroke before it reaches the app.
 //
 // Build:  swiftc -O main.swift -o ~/.local/bin/cmux-claude-queue-hotkeyd
-// Runs as LaunchAgent com.davidvesely.cmux-claude-queue-hotkeyd (KeepAlive).
+// Runs as LaunchAgent com.cmux-claude-queue.hotkeyd (KeepAlive).
 
 import AppKit
 import Carbon.HIToolbox
@@ -28,16 +30,33 @@ let captureScript: String = CommandLine.arguments.count > 1
 // Touch this file to disable the sound.
 let soundOptOutPath = ("~/.config/cmux-claude-queue/no-sound" as NSString).expandingTildeInPath
 
+private struct Hotkey {
+    let id: UInt32
+    let modifiers: UInt32
+    let action: String
+    let sound: Bool
+}
+
+private let hotkeys: [Hotkey] = [
+    Hotkey(id: 1, modifiers: UInt32(optionKey), action: "capture", sound: true),
+    // the manager pane is its own visible feedback, no sound needed
+    Hotkey(id: 2, modifiers: UInt32(optionKey | shiftKey), action: "manage-open", sound: false),
+]
+
 final class HotkeyDaemon {
-    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyRefs: [EventHotKeyRef] = []
     private var lastFire = DispatchTime(uptimeNanoseconds: 0)
     private var children = Set<Process>()
 
     func start() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                       eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetEventDispatcherTarget(), { _, _, userData in
-            Unmanaged<HotkeyDaemon>.fromOpaque(userData!).takeUnretainedValue().fire()
+        InstallEventHandler(GetEventDispatcherTarget(), { _, event, userData in
+            var hkID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+            Unmanaged<HotkeyDaemon>.fromOpaque(userData!).takeUnretainedValue().fire(id: hkID.id)
             return noErr
         }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), nil)
 
@@ -53,23 +72,28 @@ final class HotkeyDaemon {
 
     private func syncRegistration(frontmost: String?) {
         let wanted = frontmost.map(targetBundleIDs.contains) ?? false
-        if wanted && hotKeyRef == nil {
-            let hotKeyID = EventHotKeyID(signature: OSType(0x4351_4844), id: 1) // "CQHD"
-            let status = RegisterEventHotKey(UInt32(kVK_Return), UInt32(optionKey),
-                                             hotKeyID, GetEventDispatcherTarget(), 0, &hotKeyRef)
-            if status != noErr {
-                // e.g. another app owns Opt+Return system-wide; without this the
-                // hotkey would just silently never fire (err log via LaunchAgent)
-                FileHandle.standardError.write(Data("RegisterEventHotKey failed: \(status)\n".utf8))
-                hotKeyRef = nil
+        if wanted && hotKeyRefs.isEmpty {
+            for hk in hotkeys {
+                var ref: EventHotKeyRef?
+                let hotKeyID = EventHotKeyID(signature: OSType(0x4351_4844), id: hk.id) // "CQHD"
+                let status = RegisterEventHotKey(UInt32(kVK_Return), hk.modifiers,
+                                                 hotKeyID, GetEventDispatcherTarget(), 0, &ref)
+                if status != noErr || ref == nil {
+                    // e.g. another app owns the combo system-wide; without this
+                    // the hotkey would just silently never fire
+                    FileHandle.standardError.write(Data("RegisterEventHotKey id \(hk.id) failed: \(status)\n".utf8))
+                    continue
+                }
+                hotKeyRefs.append(ref!)
             }
-        } else if !wanted, let ref = hotKeyRef {
-            UnregisterEventHotKey(ref)
-            hotKeyRef = nil
+        } else if !wanted, !hotKeyRefs.isEmpty {
+            for ref in hotKeyRefs { UnregisterEventHotKey(ref) }
+            hotKeyRefs.removeAll()
         }
     }
 
-    fileprivate func fire() {
+    fileprivate func fire(id: UInt32) {
+        guard let hk = hotkeys.first(where: { $0.id == id }) else { return }
         // belt and braces: registration should already scope us to the targets
         guard let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
               targetBundleIDs.contains(front) else { return }
@@ -78,14 +102,14 @@ final class HotkeyDaemon {
         let now = DispatchTime.now()
         guard now.uptimeNanoseconds - lastFire.uptimeNanoseconds > 300_000_000 else { return }
         lastFire = now
-        if !FileManager.default.fileExists(atPath: soundOptOutPath) {
+        if hk.sound && !FileManager.default.fileExists(atPath: soundOptOutPath) {
             let sound = NSSound(named: "Pop")
             sound?.volume = 0.5
             sound?.play()
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: captureScript)
-        p.arguments = ["capture"]
+        p.arguments = [hk.action]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         p.environment = env
@@ -94,7 +118,7 @@ final class HotkeyDaemon {
             DispatchQueue.main.async { self?.children.remove(proc) }
         }
         do { try p.run(); children.insert(p) } catch {
-            FileHandle.standardError.write(Data("capture spawn failed: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("\(hk.action) spawn failed: \(error)\n".utf8))
         }
     }
 }

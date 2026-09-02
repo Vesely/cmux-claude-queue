@@ -12,6 +12,8 @@ Claude Code has no native message queue: anything you type while a turn is runni
 
 No new tab, no focus change, no steering. If the session is idle, Opt+Enter simply submits the draft like a plain Enter. Multiple queued prompts are delivered in FIFO order.
 
+**Opt+Shift+Enter** opens the queue manager: a small split pane below the session listing everything waiting. Arrows (or `j`/`k`) select, `Enter`/`e` edits the prompt in place (prefilled, readline editing), `d` deletes it, `q`/`Esc` closes the pane. Edits and deletes share the delivery lock, so racing an in-flight delivery is safe; the list live-refreshes while open.
+
 ## How it works
 
 Claude Code cannot intercept mid-turn input (messages typed while a turn runs bypass all its hooks), so the queue operates one level below, on the terminal itself, using cmux's control socket:
@@ -35,7 +37,7 @@ hotkeyd ──spawns──▶ capture ──Ctrl+U──▶ input box cleared
                             removing it from the queue
 ```
 
-- **`hotkeyd/main.swift`** — a ~80-line daemon. Registers Opt+Return as a system hotkey via Carbon `RegisterEventHotKey` *only while cmux is the frontmost app* (no Accessibility permission needed) and spawns `cmux-claude-queue capture`. In every other app Opt+Enter behaves normally. It plays a quiet "Pop" the instant the hotkey fires — the capture itself takes up to a second on a busy machine, and the sound confirms the press was heard before anything visible happens (`touch ~/.config/cmux-claude-queue/no-sound` to disable).
+- **`hotkeyd/main.swift`** — a ~130-line daemon. Registers Opt+Return (capture) and Opt+Shift+Return (queue manager) as system hotkeys via Carbon `RegisterEventHotKey` *only while cmux is the frontmost app* (no Accessibility permission needed). In every other app both combos behave normally. It plays a quiet "Pop" the instant the capture hotkey fires — the capture takes up to a second on a busy machine, and the sound confirms the press was heard before anything visible happens (`touch ~/.config/cmux-claude-queue/no-sound` to disable).
 - **`capture`** — finds the Claude session in the focused cmux workspace, scrapes the draft from the terminal screen (`cmux read-screen`), clears the box, appends the draft to a per-surface queue file. Idle session: just presses Enter instead. A marker file set on entry makes the statusline show a transient `⏳ Queue: …` placeholder while the capture is still working, so visible feedback is one refresh (~2 s) away even before the box clears.
 - **`statusline`** — a Claude Code `statusLine` wrapper. Serves your previous statusline command (if any) stale-while-revalidate: its last output comes from a per-session cache instantly and a detached background job refreshes the cache when it is older than 10 s, so the wrapper never blocks on an expensive chain (Claude Code kills statusline commands that outlive the refresh interval). It appends the queue row and doubles as a delivery pump: pressing Esc kills a turn without emitting any event, so the periodic statusline refresh fires an invisible retry notification while the queue is non-empty.
 - **`notifyhook`** — a cmux notification hook. On every notification (turn complete, or a retry tick) it checks per session whether the turn is really over, types the queued text into the input box and presses Enter, then waits for the matching `UserPromptSubmit` event in cmux's event log before removing the item from the queue. It backs off if you have a new draft in the box, and never injects into a running turn.

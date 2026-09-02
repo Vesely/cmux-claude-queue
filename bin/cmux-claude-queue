@@ -410,6 +410,33 @@ qlock_take() {
 }
 qlock_drop() { rm -rf "$QDIR/$1.qlock"; }
 
+# Replace (with $4 set) or delete (without) queue item $2 of surface $1, but
+# only if it still holds $3 — a delivery may pop or reorder the file between
+# the manager's render and the user's keypress, and a blind index write would
+# then hit the wrong line. Returns 1 when the file changed underneath.
+queue_mutate() {
+  local surface="$1" idx="$2" expected="$3" new="${4-}"
+  local qfile="$QDIR/$surface.queue" i=0 l changed=""
+  qlock_take "$surface" || return 1
+  : > "$qfile.tmp"
+  while IFS= read -r l; do
+    if [ "$i" = "$idx" ] && [ "$l" = "$expected" ]; then
+      changed=1
+      [ -n "$new" ] && printf '%s\n' "$new" >> "$qfile.tmp"
+    else
+      printf '%s\n' "$l" >> "$qfile.tmp"
+    fi
+    i=$((i + 1))
+  done < "$qfile" 2>/dev/null
+  if [ -n "$changed" ]; then
+    mv -f "$qfile.tmp" "$qfile"
+  else
+    rm -f "$qfile.tmp"
+  fi
+  qlock_drop "$surface"
+  [ -n "$changed" ]
+}
+
 # Try to deliver the first queued line for a surface. Lock-guarded so capture,
 # the notification hook and a manual drain never double-deliver. Returns 0 when
 # the line was confirmed delivered, 1 otherwise (line stays queued for the next
@@ -902,8 +929,134 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     done
     ;;
 
+  manage-open)
+    # Open (or refocus) the interactive queue manager for the focused
+    # workspace's Claude session, as a bottom split pane. Triggered by the
+    # Opt+Shift+Enter hotkey or a Command Palette action.
+    ws="${CMUX_WORKSPACE_ID:-}"
+    if [ -z "$ws" ]; then
+      ws=$("$CMUX_BIN" rpc workspace.current '{}' 2>/dev/null \
+        | plutil -extract workspace.id raw -o - -- - 2>/dev/null)
+    fi
+    [ -z "$ws" ] && { log "manage-open: no workspace"; exit 1; }
+    ctx=$(capture_ctx "$ws")
+    IFS=$'\x1f' read -r target _ _ _ <<< "$ctx"
+    [ -z "$target" ] && target=$(target_surface "$ws")
+    if [ -z "$target" ]; then
+      "$CMUX_BIN" notify --title "Queue" --body "No Claude session found in this workspace" --workspace "$ws" >/dev/null 2>&1
+      exit 0
+    fi
+    # a manager for this session may already be open: refocus instead of
+    # stacking panes (the recorded pane lives in the same workspace, so the
+    # focus cannot yank the user's workspace selection)
+    pfile="$QDIR/manage-$target.pane"
+    old=$(cat "$pfile" 2>/dev/null)
+    if [ -n "$old" ] && "$CMUX_BIN" rpc surface.focus "{\"surface_id\": \"$old\"}" >/dev/null 2>&1; then
+      exit 0
+    fi
+    out=$("$CMUX_BIN" new-pane --direction down --workspace "$ws" --focus true --id-format both 2>/dev/null)
+    pane=$(printf '%s' "$out" | sed -n 's/.*surface:[0-9]* (\([0-9A-Fa-f-]*\)).*/\1/p')
+    [ -z "$pane" ] && { log "manage-open: new-pane failed: $out"; exit 1; }
+    printf '%s\n' "$pane" > "$pfile"
+    sleep 0.4  # let the pane's shell start before typing into it
+    "$CMUX_BIN" send --surface "$pane" "exec '$0' manage $target" >/dev/null 2>&1
+    "$CMUX_BIN" send-key --surface "$pane" enter >/dev/null 2>&1
+    exit 0
+    ;;
+
+  manage)
+    # Interactive queue manager; runs inside the pane manage-open creates
+    # (exec'd over the shell, so the pane closes itself on exit). Arrows or
+    # j/k select, Enter/e edits the line, d deletes, q/Esc closes. Every
+    # mutation goes through queue_mutate (qlock + content check), so racing
+    # a live delivery is safe. The list auto-refreshes while idle.
+    surface="${2:?usage: cmux-claude-queue manage <surfaceId>}"
+    trap 'rm -f "$QDIR/manage-$surface.pane"; printf "\033[?25h"' EXIT
+    qfile="$QDIR/$surface.queue"
+    sel=0
+    cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}
+    while :; do
+      n=0
+      items=()
+      while IFS= read -r l; do
+        [ -n "$l" ] && { items[$n]="$l"; n=$((n + 1)); }
+      done < "$qfile" 2>/dev/null
+      [ "$sel" -ge "$n" ] && sel=$((n - 1))
+      [ "$sel" -lt 0 ] && sel=0
+      printf '\033[?25l\033[2J\033[H'
+      printf '\033[1m⏳ Prompt queue\033[0m \033[2m(%d waiting)\033[0m\n\n' "$n"
+      if [ "$n" -eq 0 ]; then
+        printf '  \033[2mempty — new items arrive with Opt+Enter\033[0m\n'
+      else
+        i=0
+        while [ "$i" -lt "$n" ]; do
+          item=${items[$i]}
+          maxw=$((cols - 8))
+          if [ "${#item}" -gt "$maxw" ]; then item="${item:0:$maxw}…"; fi
+          if [ "$i" = "$sel" ]; then
+            printf '  \033[7m %d. %s \033[0m\n' "$((i + 1))" "$item"
+          else
+            printf '   %d. %s\n' "$((i + 1))" "$item"
+          fi
+          i=$((i + 1))
+        done
+      fi
+      printf '\n\033[2m[↑↓/jk] select   [Enter/e] edit   [d] delete   [q/Esc] close\033[0m\n'
+      key=""
+      t0=$SECONDS
+      if ! IFS= read -rsn1 -t 2 key; then
+        # slow failure = timeout (refresh the list, a delivery may have run);
+        # instant failure = the pane tty is gone, leave
+        [ $((SECONDS - t0)) -ge 1 ] && continue
+        break
+      fi
+      case "$key" in
+        $'\x1b')
+          rest=""
+          IFS= read -rsn2 -t 1 rest || true
+          case "$rest" in
+            '[A') sel=$((sel - 1)) ;;
+            '[B') sel=$((sel + 1)) ;;
+            '') break ;;  # bare Esc
+          esac ;;
+        k) sel=$((sel - 1)) ;;
+        j) sel=$((sel + 1)) ;;
+        q) break ;;
+        d)
+          [ "$n" -gt 0 ] && queue_mutate "$surface" "$sel" "${items[$sel]}" || true ;;
+        e|'')
+          if [ "$n" -gt 0 ]; then
+            printf '\033[?25h\033[2J\033[H\033[1mEdit item %d\033[0m \033[2m(Enter saves, Ctrl+C cancels)\033[0m\n\n' "$((sel + 1))"
+            # bash 3.2 has no read -i; python readline gives a prefilled,
+            # editable line. It needs the tty on stdin AND stdout to render
+            # the editing, so the result travels via a temp file instead of
+            # command substitution.
+            edtmp="$QDIR/manage-$surface.edit"
+            newtext=""
+            if python3 -c '
+import readline, sys
+readline.set_startup_hook(lambda: readline.insert_text(sys.argv[1]))
+try:
+    text = input("> ")
+except (KeyboardInterrupt, EOFError):
+    sys.exit(1)
+open(sys.argv[2], "w").write(text)' "${items[$sel]}" "$edtmp" </dev/tty >/dev/tty 2>&1; then
+              newtext=$(cat "$edtmp" 2>/dev/null)
+            fi
+            rm -f "$edtmp"
+            newtext=$(printf '%s' "$newtext" | tr '\n' ' ')
+            if [ -n "$newtext" ] && [ "$newtext" != "${items[$sel]}" ]; then
+              queue_mutate "$surface" "$sel" "${items[$sel]}" "$newtext" || true
+            fi
+          fi ;;
+      esac
+      [ "$sel" -lt 0 ] && sel=0
+    done
+    exit 0
+    ;;
+
   *)
-    echo "usage: cmux-claude-queue [capture|statusline|notifyhook|add <surface> <text>|drain <surface>]"
+    echo "usage: cmux-claude-queue [capture|statusline|notifyhook|add <surface> <text>|manage-open|drain <surface>]"
     exit 1
     ;;
 esac
