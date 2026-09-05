@@ -136,7 +136,7 @@ case "${1:-capture}" in
         # $(<file) forks but does not exec — measurably cheaper than cat here
         if [ -s "$cache" ]; then printf '%s\n' "$(<"$cache")"; fi
         guard="$cache.bg"
-        if [ -z "$(/usr/bin/find "$cache" -newermt '-10 seconds' 2>/dev/null)" ] \
+        if [ -z "$(/usr/bin/find "$cache" -newermt '-60 seconds' 2>/dev/null)" ] \
            && [ -z "$(/usr/bin/find "$guard" -newermt '-30 seconds' 2>/dev/null)" ]; then
           # the guard records the worker pid: a chain that hangs past the
           # 30 s crash TTL is killed here, not accumulated one process per
