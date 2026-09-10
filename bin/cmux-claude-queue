@@ -123,9 +123,9 @@ case "${1:-capture}" in
       # the queue row and the delivery pump below silently stopped). The
       # chain therefore NEVER runs in the foreground: the last output is
       # served from a per-session cache immediately, and once the cache is
-      # older than 10 s a detached background job refreshes it for later
+      # older than 180 s a detached background job refreshes it for later
       # runs. The wrapper stays fast no matter what the chain costs;
-      # branch/context info lagging ~10 s is the trade.
+      # branch/context info lagging ~180 s is the trade.
       cache=""
       [ -n "$sid" ] && cache="$QDIR/slcache-$sid"
       if [ -z "$cache" ]; then
@@ -136,7 +136,7 @@ case "${1:-capture}" in
         # $(<file) forks but does not exec — measurably cheaper than cat here
         if [ -s "$cache" ]; then printf '%s\n' "$(<"$cache")"; fi
         guard="$cache.bg"
-        if [ -z "$(/usr/bin/find "$cache" -newermt '-60 seconds' 2>/dev/null)" ] \
+        if [ -z "$(/usr/bin/find "$cache" -newermt '-180 seconds' 2>/dev/null)" ] \
            && [ -z "$(/usr/bin/find "$guard" -newermt '-30 seconds' 2>/dev/null)" ]; then
           # the guard records the worker pid: a chain that hangs past the
           # 30 s crash TTL is killed here, not accumulated one process per
