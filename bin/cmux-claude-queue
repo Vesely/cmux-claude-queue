@@ -996,6 +996,37 @@ print("".join(out).strip())
 
 read_box() { "$CMUX_BIN" read-screen --surface "$1" 2>/dev/null | parse_input_box; }
 
+# Is what the box shows the text OUR last attempt typed and then abandoned?
+# The divergence branch of deliver_once leaves it there on purpose (so the
+# user can just press Enter), and the "never clobber a draft" guard then read
+# it back as a foreign draft and held off on every tick — for 8 hours, live
+# in production. Worse, the retry that would have counted a strike and parked
+# the line could never run, so the escape hatch built for exactly this case
+# was unreachable. The record makes our own leftovers recognisable.
+box_is_leftover() {  # $1 = surface, $2 = queued line, $3 = current box
+  local lfile="$QDIR/$1.leftover"
+  [ -f "$lfile" ] || return 1
+  [ "$(sed -n 1p "$lfile")" = "$2" ] || { rm -f "$lfile"; return 1; }
+  [ "$(sed -n '2,$p' "$lfile")" = "$3" ]
+}
+
+# One notification per blocked line. A draft sitting in the input box stops
+# delivery for as long as it is there, which is correct, but the only sign of
+# it used to be the statusline row — easy to miss for a whole night.
+holdoff_warn() {  # $1 = surface, $2 = queued line
+  local hfile="$QDIR/$1.holdoff"
+  if [ "$(sed -n 1p "$hfile" 2>/dev/null)" != "$2" ]; then
+    printf '%s\n' "$2" > "$hfile"   # first hold-off for this line: stamp it
+  elif [ "$(sed -n 2p "$hfile" 2>/dev/null)" != "notified" ] \
+       && [ -z "$(/usr/bin/find "$hfile" -newermt '-10 minutes' 2>/dev/null)" ]; then
+    log "deliver surface=$1 blocked 10 min by a draft in the box, notifying"
+    "$CMUX_BIN" notify --title "Queue blocked" \
+      --body "A queued prompt cannot be delivered: a draft is sitting in the input box. Send or clear it." \
+      --surface "$1" >/dev/null 2>&1
+    printf '%s\nnotified\n' "$2" > "$hfile"
+  fi
+}
+
 # Is what the input box shows a Claude Code prompt SUGGESTION rather than a
 # typed draft? The suggestion scrapes exactly like a draft (same ❯ prefix; no
 # style attribute survives read-screen), but it is display-only over an EMPTY
@@ -1202,42 +1233,141 @@ IFS= read -r -d '' TRANSCRIPT_MATCH_PY <<'PYFRAG' || :
 def transcript_match(path, want, since):
     if not path:
         return False
+    # The prefilter runs against the RAW json line, where the prompt text is
+    # escaped. Built from the unescaped text it could never match a prompt
+    # holding a quote (or a backslash, or a newline) in its first 60 bytes:
+    # no such prompt was confirmable, so the queue kept resending it until
+    # the send ceiling parked it. Hit live on a 383-char prompt
+    # whose 46th byte was a typographic quote.
+    needle = json.dumps(want, ensure_ascii=False)[1:-1].encode("utf-8", "replace")[:60]
+    # Walk backwards in blocks rather than reading a fixed-size tail. A media
+    # heavy session writes tool results measured in hundreds of megabytes
+    # (480 MB seen live) and the entry to confirm sat 14 MB from the end,
+    # outside the old 4 MiB window — the confirmation was impossible for the
+    # same reason twice over. The scan stops at the first block whose oldest
+    # timestamp predates the bound, so an old `since` costs a few blocks and
+    # not a full-file read on every tick; MAX_SCAN caps it either way.
+    BLOCK = 4194304
+    MAX_SCAN = 67108864
+    try:
+        since_iso = datetime.datetime.fromtimestamp(
+            since - 300, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S").encode()
+    except Exception:
+        since_iso = b""
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
-            f.seek(max(0, f.tell() - 4194304))   # tail only: a transcript can be huge
-            chunk = f.read()
+            pos = f.tell()
+            carry = b""          # head of the block above, cut by the edge
+            scanned = 0
+            while pos > 0 and scanned < MAX_SCAN:
+                start = max(0, pos - BLOCK)
+                f.seek(start)
+                block = f.read(pos - start) + carry
+                scanned += pos - start
+                pos = start
+                lines = block.split(b"\n")
+                carry = lines.pop(0) if pos > 0 else b""
+                for raw in reversed(lines):
+                    if needle not in raw:
+                        continue
+                    try:
+                        d = json.loads(raw)
+                    except Exception:
+                        continue
+                    if d.get("type") != "user":
+                        continue
+                    c = (d.get("message") or {}).get("content")
+                    if isinstance(c, str):
+                        text = c
+                    elif isinstance(c, list):
+                        text = "".join(b.get("text", "") for b in c
+                                       if isinstance(b, dict) and b.get("type") == "text")
+                    else:
+                        continue
+                    if text != want:
+                        continue
+                    try:
+                        ts = datetime.datetime.fromisoformat(
+                            (d.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        continue
+                    if ts >= since:
+                        return True
+                # entries are appended in time order, so the first timestamp
+                # in a block is the oldest in it: one find and one compare
+                # per 4 MiB decides whether anything older can still qualify
+                if since_iso:
+                    i = block.find(b'"timestamp":"')
+                    if i >= 0 and block[i + 13:i + 13 + len(since_iso)] < since_iso:
+                        break
     except Exception:
         return False
-    needle = want.encode("utf-8", "replace")[:60]
-    for raw in chunk.split(b"\n"):
-        if needle not in raw:
-            continue
-        try:
-            d = json.loads(raw)
-        except Exception:
-            continue
-        if d.get("type") != "user":
-            continue
-        c = (d.get("message") or {}).get("content")
-        if isinstance(c, str):
-            text = c
-        elif isinstance(c, list):
-            text = "".join(b.get("text", "") for b in c
-                           if isinstance(b, dict) and b.get("type") == "text")
-        else:
-            continue
-        if text != want:
-            continue
-        try:
-            ts = datetime.datetime.fromisoformat(
-                (d.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
-        except Exception:
-            continue
-        if ts >= since:
-            return True
     return False
 PYFRAG
+
+# The workspace a session belongs to, from the cmux hook store.
+session_workspace() {  # $1 = session id
+  plutil -extract "sessions.$1.workspaceId" raw -o - -- "$STORE" 2>/dev/null \
+    || plutil -extract "sessions.claude-$1.workspaceId" raw -o - -- "$STORE" 2>/dev/null
+}
+
+# Did cmux itself record a prompt submit for this session's workspace at or
+# after epoch $3, matching the queued line? Unlike tool_input_length (see
+# confirm_submit) the workspace.prompt.submitted event carries the first 240
+# characters of the text, so it does not saturate and is the only event-log
+# signal that can identify a LONG prompt. It is the fallback for sessions
+# whose transcript is missing, unreadable or past MAX_SCAN.
+#
+# The event names no surface, only a workspace, so two Claude sessions in one
+# workspace are indistinguishable here. A truncated preview makes that
+# harmless (240 shared leading characters is not a collision anyone hits); an
+# untruncated one must equal the line exactly, never merely prefix it — a
+# short foreign submit that happens to start our line must not confirm it.
+preview_confirm() {  # $1 = session id, $2 = line, $3 = since (epoch)
+  local wsid
+  wsid=$(session_workspace "$1") || return 1
+  [ -n "$wsid" ] || return 1
+  python3 - "$EVENTS" "$wsid" "$2" "$3" <<'PY' 2>/dev/null
+import datetime, json, sys
+events, wsid, want, since = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+try:
+    with open(events, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 4194304))
+        chunk = f.read()
+except Exception:
+    sys.exit(1)
+key = wsid.encode()
+for raw in chunk.split(b"\n"):
+    if b"workspace.prompt.submitted" not in raw or key not in raw:
+        continue
+    try:
+        d = json.loads(raw)
+    except Exception:
+        continue
+    if d.get("name") != "workspace.prompt.submitted":
+        continue
+    p = d.get("payload") or {}
+    if p.get("workspace_id") != wsid:
+        continue
+    prev = p.get("message_preview") or ""
+    if prev.endswith("\u2026"):
+        head = prev[:-1]
+        if not head or len(want) <= len(head) or not want.startswith(head):
+            continue
+    elif prev != want:
+        continue
+    try:
+        ts = datetime.datetime.fromisoformat(
+            (d.get("occurred_at") or "").replace("Z", "+00:00")).timestamp()
+    except Exception:
+        continue
+    if ts >= since:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
 
 # Was EXACTLY this prompt submitted to this session at or after epoch $3?
 # The timestamp bound is what makes it safe: the same text may well have been
@@ -1285,6 +1415,7 @@ mtime_epoch() { /usr/bin/stat -f %Fm "$1" 2>/dev/null || echo 0; }
 confirm_submit() {
   local sid="$1" offset="$2" line="$3" strict="${4:-loose}" since="${5:-0}"
   transcript_confirm "$sid" "$line" "$since" && return 0
+  preview_confirm "$sid" "$line" "$since" && return 0
   # a rotated event log (cmux renames it to events.jsonl.1 at 16 MB) leaves
   # every stored offset past the end of the new file, where tail reads nothing
   [ "$offset" -gt "$(wc -c < "$EVENTS" 2>/dev/null || echo 0)" ] 2>/dev/null && offset=0
@@ -1573,7 +1704,8 @@ deliver_once() {
     log "deliver surface=$surface late-confirmed, not resending: $line"
     if qlock_take "$surface"; then
       pop_head "$surface" "$line" \
-        && rm -f "$afile" "$QDIR/$surface.sends" "$QDIR/$surface.parked"
+        && rm -f "$afile" "$QDIR/$surface.sends" "$QDIR/$surface.parked" \
+                 "$QDIR/$surface.leftover" "$QDIR/$surface.holdoff"
       wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
@@ -1592,7 +1724,8 @@ deliver_once() {
     log "deliver surface=$surface already submitted since enqueue, popping without resend: $line"
     if qlock_take "$surface"; then
       pop_head "$surface" "$line"
-      rm -f "$QDIR/$surface.sends" "$QDIR/$surface.parked"
+      rm -f "$QDIR/$surface.sends" "$QDIR/$surface.parked" \
+            "$QDIR/$surface.leftover" "$QDIR/$surface.holdoff"
       wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
@@ -1623,19 +1756,26 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   ghost=""
   box=$(read_box "$surface")
   if [ -n "$box" ] && [ "$box" != "$line" ]; then
-    if ! box_is_ghost "$surface"; then
+    if box_is_leftover "$surface" "$line" "$box"; then
+      # not a draft, our own abandoned attempt: clear it and try again, so a
+      # second divergence counts a strike and the park below can be reached
+      log "deliver surface=$surface box holds our own abandoned attempt, retrying"
+    elif ! box_is_ghost "$surface"; then
       log "deliver surface=$surface holding off, user draft in box"
+      holdoff_warn "$surface" "$line"
       rm -rf "$lock"
       return 1
+    else
+      log "deliver surface=$surface box content is a ghost suggestion, proceeding"
+      # remember it: a suggestion sits over an EMPTY buffer, and every later
+      # "does the box still hold our line?" test must read it as empty. Claude
+      # Code suggests the previous prompt, which after a delivery is our own
+      # line — read literally, that says "the keys never landed", and the line
+      # goes out again. Every 15 s (hit live, five copies).
+      ghost=1
     fi
-    log "deliver surface=$surface box content is a ghost suggestion, proceeding"
-    # remember it: a suggestion sits over an EMPTY buffer, and every later
-    # "does the box still hold our line?" test must read it as empty. Claude
-    # Code suggests the previous prompt, which after a delivery is our own
-    # line — read literally, that says "the keys never landed", and the line
-    # goes out again. Every 15 s (hit live, five copies).
-    ghost=1
   fi
+  rm -f "$QDIR/$surface.holdoff"
 
   # A submit already in flight. Our previous attempt typed this exact line and
   # the box no longer holds it, yet no matching UserPromptSubmit has landed.
@@ -1651,6 +1791,12 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
      && [ -n "$(/usr/bin/find "$afile" -newermt '-10 minutes' 2>/dev/null)" ]; then
     box=$(read_box "$surface")
     [ -n "$ghost" ] && box=""
+    if box_is_leftover "$surface" "$line" "$box"; then
+      # the box holds what our last attempt typed and abandoned BEFORE the
+      # Enter, so nothing can be in flight — treat it as keys that never
+      # landed and retry now, instead of waiting out the ten-minute bound
+      log "deliver surface=$surface abandoned attempt still in the box, not in flight"
+    else
     case "$box" in
       "$line"*)
         # The box shows our line — but Claude Code suggests the prompt it just
@@ -1667,6 +1813,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
         rm -rf "$lock"
         return 1 ;;
     esac
+    fi
   fi
 
   # Hard ceiling on how many times ONE line may ever be typed into a session,
@@ -1716,6 +1863,9 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     "$box"*) : ;;
     *)
       log "deliver surface=$surface box diverged after typing, not submitting"
+      # what stays in the box is ours; without this record the guard above
+      # would read it as a user draft and never let the retry happen
+      printf '%s\n%s\n' "$line" "$box" > "$QDIR/$surface.leftover"
       # retry cap: a line that keeps diverging (scrape imperfection on some
       # exotic rendering) must not fight the user forever. After 3 attempts
       # park it: the typed text stays visible in the box, the user just
@@ -1734,7 +1884,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
           wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
           qlock_drop "$surface"
         fi
-        rm -f "$dfile"
+        rm -f "$dfile" "$QDIR/$surface.leftover"
         "$CMUX_BIN" notify --title "Queue" \
           --body "Delivery parked: the text is in the input box, press Enter to send it" \
           --surface "$surface" >/dev/null 2>&1
@@ -1769,7 +1919,8 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     # duplicate prompt. With the record, the next tick takes the late-confirm
     # path above and pops without resending.
     rm -f "$QDIR/$surface.diverge" "$QDIR/$surface.resend" \
-          "$QDIR/$surface.sends" "$QDIR/$surface.parked"
+          "$QDIR/$surface.sends" "$QDIR/$surface.parked" \
+          "$QDIR/$surface.leftover" "$QDIR/$surface.holdoff"
     attempt_write "$surface" "$offset" "$line"
     if qlock_take "$surface"; then
       pop_head "$surface" "$line" \
@@ -2003,6 +2154,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
       -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' \
       -o -name '*.diverge' -o -name '*.resend' -o -name 'sidmap-*' \
       -o -name '*.sends' -o -name '*.parked' \
+      -o -name '*.leftover' -o -name '*.holdoff' \
       -o -name '*.spool' -o -name '*.spool.tmp' \) -mtime +1 -delete 2>/dev/null
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue
