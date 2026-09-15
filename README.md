@@ -5,8 +5,6 @@ have it arrive as a fresh turn — after the current one has actually finished.
 
 ![Option+Enter queues "now update the README" while Claude is still working; the statusline holds it, and it is submitted as a new turn once the first one finishes](docs/demo.gif)
 
-<sub>`Option+Enter` instead of `Enter`: the draft leaves the box, waits in the statusline, and arrives as its own turn.</sub>
-
 macOS · [cmux](https://cmux.io) · MIT
 
 ## Why
@@ -38,7 +36,6 @@ People have been asking for this for a while:
 | --- | --- |
 | `Option+Enter` | Queues the draft. Box clears in ~60 ms, the statusline shows `⏳ Queue: …` |
 | `Option+Shift+Enter` | Opens the queue manager — `↑↓` select, `e` edit, `d` delete, `q` close |
-| `Ctrl+G` | Optional: queues the draft *exactly* as typed, blank lines included |
 | `!qq text` | Optional: queues from Claude Code's `!` bash mode, without leaving the keyboard |
 
 On an idle session `Option+Enter` just submits, like a plain Enter. Queues are FIFO and per cmux
@@ -121,7 +118,7 @@ Then drop the `notifications.hooks` entry from `cmux.json` and restore your prev
 ## More
 
 [How it works, and why](docs/internals.md) — architecture, the delivery guarantees, performance
-notes, and the `Ctrl+G` setup.
+notes, and the optional `Ctrl+G` capture that queues a draft without scraping the screen.
 
 ## License
 
