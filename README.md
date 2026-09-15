@@ -134,4 +134,7 @@ Then remove the `notifications.hooks` entry from `cmux.json` and restore your pr
 [docs/internals.md](docs/internals.md) covers the architecture, what delivery does and does not
 guarantee, the performance numbers, and two optional extras: `Ctrl+G` capture and `!qq`.
 
+[NOTES.md](NOTES.md) is the field notes: the cmux and Claude Code behaviours that cost time to
+find out, kept because they outlive this implementation.
+
 MIT
