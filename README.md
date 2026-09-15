@@ -1,11 +1,22 @@
-# cmux-claude-queue
+<h1 align="center">cmux-claude-queue</h1>
 
-Press `Option+Enter` instead of `Enter`. Your draft leaves the input box, waits on disk, and
-goes in as a new turn once the current one has ended.
+<h4 align="center">
+  Press <code>Option+Enter</code> instead of <code>Enter</code>.<br>
+  Your draft leaves the input box, waits on disk, and goes in as a new turn once the current one has ended.
+</h4>
 
-![Option+Enter queues "now update the README" while Claude is still working; the statusline holds it, and it is submitted as a new turn once the first one finishes](docs/demo.gif)
+<p align="center">
+  <a href="https://www.npmjs.com/package/cmux-claude-queue"><img src="https://img.shields.io/npm/v/cmux-claude-queue" alt="npm version"></a>
+  <img src="https://img.shields.io/badge/platform-macOS-lightgrey" alt="macOS only">
+</p>
 
-macOS · [Claude Code](https://claude.com/claude-code) · [cmux](https://cmux.io) · MIT
+<p align="center">
+  <img alt="Option+Enter queues a draft while Claude is working; it is submitted as a new turn once that turn finishes" src="docs/demo.gif">
+</p>
+
+<p align="center">
+  For <a href="https://claude.com/claude-code">Claude Code</a> running in <a href="https://cmux.io">cmux</a>.
+</p>
 
 ## Why not the built-in queue
 
@@ -42,12 +53,12 @@ queue, and delivery targets that same surface.
 Both shortcuts are registered only while cmux is frontmost, so they behave normally everywhere
 else.
 
-## Requirements
+## Setup
 
-macOS · [cmux](https://github.com/manaflow-ai/cmux) ≥ 0.64.20 · Claude Code ·
-Xcode Command Line Tools, for `swiftc` · `python3` on `$PATH` · Node ≥ 18 to install from npm
+Needs macOS, [cmux](https://github.com/manaflow-ai/cmux) ≥ 0.64.20, Claude Code, `python3`, and
+the Xcode Command Line Tools for `swiftc`.
 
-## Install
+**1. Install**
 
 ```sh
 npm i -g cmux-claude-queue
@@ -55,18 +66,22 @@ cmux-claude-queue-setup
 ```
 
 `setup` builds the hotkey daemon, loads its LaunchAgent, and prints two config snippets with
-your paths filled in: one for `~/.config/cmux/cmux.json`, one for `~/.claude/settings.json`.
-It does not edit either file. Paste both in, then run `cmux reload-config`.
+your paths filled in. It does not edit either file for you.
 
-Already have a statusline command? Save it as `~/.config/cmux-claude-queue/statusline-chain`.
-It keeps running, and the queue row is appended below its output.
+**2. Paste the cmux snippet** into `~/.config/cmux/cmux.json`, then run `cmux reload-config`.
 
-> **Password mode.** The cmux snippet turns on socket password control, so any process that can
-> read your `cmux.json` can drive your cmux terminals. Check the file is `chmod 600`. This is a
-> wider gate than cmux's default `cmuxOnly` mode, which rejects the hotkey daemon because the
-> daemon is not a cmux child process.
+**3. Paste the Claude Code snippet** into `~/.claude/settings.json`.
 
-### Or let your agent install it
+Already have a statusline command? Save it as `~/.config/cmux-claude-queue/statusline-chain`
+first. It keeps running, and the queue row is appended below its output.
+
+> **Password mode.** Step 2 turns on socket password control, so any process that can read your
+> `cmux.json` can drive your cmux terminals. Check the file is `chmod 600`. This is a wider gate
+> than cmux's default `cmuxOnly` mode, which rejects the hotkey daemon because the daemon is not
+> a cmux child process.
+
+<details>
+<summary>Or let your agent do it</summary>
 
 Paste this into Claude Code:
 
@@ -75,8 +90,10 @@ Paste this into Claude Code:
 > any existing statusLine command to `~/.config/cmux-claude-queue/statusline-chain` first, then
 > run `cmux reload-config` and tell me what you changed.
 
+</details>
+
 <details>
-<summary>From source instead</summary>
+<summary>Or install from source</summary>
 
 ```sh
 git clone https://github.com/Vesely/cmux-claude-queue
@@ -116,3 +133,5 @@ Then remove the `notifications.hooks` entry from `cmux.json` and restore your pr
 
 [docs/internals.md](docs/internals.md) covers the architecture, what delivery does and does not
 guarantee, the performance numbers, and two optional extras: `Ctrl+G` capture and `!qq`.
+
+MIT
