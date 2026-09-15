@@ -36,12 +36,12 @@ People have been asking for this for a while:
 
 | Key | What happens |
 | --- | --- |
-| `Opt+Enter` | Queues the draft. Box clears in ~60 ms, the statusline shows `⏳ Queue: …` |
-| `Opt+Shift+Enter` | Opens the queue manager — `↑↓` select, `e` edit, `d` delete, `q` close |
+| `Option+Enter` | Queues the draft. Box clears in ~60 ms, the statusline shows `⏳ Queue: …` |
+| `Option+Shift+Enter` | Opens the queue manager — `↑↓` select, `e` edit, `d` delete, `q` close |
 | `Ctrl+G` | Optional: queues the draft *exactly* as typed, blank lines included |
 | `!qq text` | Optional: queues from Claude Code's `!` bash mode, without leaving the keyboard |
 
-On an idle session `Opt+Enter` just submits, like a plain Enter. Queues are FIFO and per cmux
+On an idle session `Option+Enter` just submits, like a plain Enter. Queues are FIFO and per cmux
 surface, so every session has its own and a prompt can only land where it was captured.
 
 Outside cmux, both combos behave normally — the hotkey is registered only while cmux is
@@ -50,23 +50,41 @@ frontmost.
 ## Install
 
 ```sh
-git clone https://github.com/Vesely/cmux-claude-queue
-cd cmux-claude-queue
-./install.sh
+npm i -g cmux-claude-queue
+cmux-claude-queue-setup
 ```
 
-The installer copies `bin/cmux-claude-queue` into `~/.local/bin` (re-run after `git pull` to
-upgrade; `--dev` symlinks instead), builds the daemon, loads the LaunchAgent, and prints the two
-config snippets you add yourself:
+`setup` builds the hotkey daemon, loads its LaunchAgent, and prints two config snippets
+with your paths already filled in — one for `~/.config/cmux/cmux.json` (socket password
+mode + the delivery hook), one for `~/.claude/settings.json` (the statusline). It never
+edits your configs itself, so paste those two in and run `cmux reload-config`.
 
-1. **`~/.config/cmux/cmux.json`** — `automation.socketControlMode: "password"` with a generated
-   `automation.socketPassword`, and `cmux-claude-queue notifyhook` under `notifications.hooks`.
-   Then `cmux reload-config`.
-2. **`~/.claude/settings.json`** — point `statusLine.command` at `cmux-claude-queue statusline`
-   with `refreshInterval: 1`.
+Already have a statusline? Save it as `~/.config/cmux-claude-queue/statusline-chain` and it
+keeps running, cached, with the queue row appended below it.
 
-Already have a statusline? Save it as `~/.config/cmux-claude-queue/statusline-chain` and it keeps
-running, cached, with the queue row appended below it.
+### Or let your agent install it
+
+Paste this into Claude Code:
+
+> Install cmux-claude-queue on this machine: run `npm i -g cmux-claude-queue && cmux-claude-queue-setup`,
+> then apply the two snippets it prints — the `automation` block and the `notifications.hooks`
+> entry into `~/.config/cmux/cmux.json`, and the `statusLine` block into `~/.claude/settings.json`.
+> If a statusLine command is already set, move it to `~/.config/cmux-claude-queue/statusline-chain`
+> first. Finish with `cmux reload-config` and tell me what you changed.
+
+<details>
+<summary>From source instead</summary>
+
+```sh
+git clone https://github.com/Vesely/cmux-claude-queue
+cd cmux-claude-queue && ./install.sh
+```
+
+A clone is copied into `~/.local/bin`, so re-run `./install.sh` after a `git pull`. An npm
+install is symlinked instead, so `npm update -g cmux-claude-queue` takes effect immediately
+(re-run setup only when the daemon itself changed).
+
+</details>
 
 > **Note on password mode.** Any process that can read your `cmux.json` can then control your
 > cmux terminals. The file is `600` in your home directory — the same trust boundary as your

@@ -8,10 +8,27 @@
 # yourself — the installer never edits your configs.
 set -euo pipefail
 
-MODE="copy"
-[ "${1:-}" = "--dev" ] && MODE="link"
+# Resolve $0 through symlinks. Installed from npm this script is reached via a
+# symlink in npm's bin directory, where dirname $0 points at that directory
+# rather than at the package. macOS has no readlink -f, hence the loop.
+SELF="$0"
+while [ -L "$SELF" ]; do
+  target="$(readlink "$SELF")"
+  case "$target" in
+    /*) SELF="$target" ;;
+    *)  SELF="$(dirname "$SELF")/$target" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$SELF")" && pwd)"
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
+# A clone is copied out so it survives the clone moving; an npm install is
+# linked so `npm update -g` takes effect without re-running this.
+MODE="copy"
+case "$REPO" in */node_modules/*) MODE="link" ;; esac
+case "${1:-}" in
+  --dev|--link) MODE="link" ;;
+  --copy)       MODE="copy" ;;
+esac
 BIN_DIR="${CMUX_CLAUDE_QUEUE_BIN_DIR:-$HOME/.local/bin}"
 LABEL="com.cmux-claude-queue.hotkeyd"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -25,7 +42,7 @@ command -v swiftc >/dev/null 2>&1 || {
 mkdir -p "$BIN_DIR" "$STATE_DIR" "$HOME/Library/LaunchAgents"
 
 if [ "$MODE" = "link" ]; then
-  echo "==> linking $BIN_DIR/cmux-claude-queue (dev mode: repo edits go live)"
+  echo "==> linking $BIN_DIR/cmux-claude-queue (edits to $REPO go live)"
   ln -sf "$REPO/bin/cmux-claude-queue" "$BIN_DIR/cmux-claude-queue"
   ln -sf "$REPO/bin/cmux-claude-queue-editor" "$BIN_DIR/cmux-claude-queue-editor"
 else

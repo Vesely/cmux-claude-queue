@@ -1,0 +1,46 @@
+{
+  "name": "cmux-claude-queue",
+  "version": "1.0.0",
+  "description": "Queue your next prompt for Claude Code with one keypress, delivered as a fresh turn only after the current one actually ends. macOS + cmux.",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "cmux",
+    "prompt-queue",
+    "queue",
+    "terminal",
+    "macos",
+    "cli",
+    "developer-tools"
+  ],
+  "homepage": "https://github.com/Vesely/cmux-claude-queue#readme",
+  "bugs": "https://github.com/Vesely/cmux-claude-queue/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vesely/cmux-claude-queue.git"
+  },
+  "license": "MIT",
+  "author": "David Veselý",
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "cmux-claude-queue": "bin/cmux-claude-queue",
+    "cmux-claude-queue-setup": "install.sh"
+  },
+  "files": [
+    "bin/",
+    "hotkeyd/",
+    "extras/",
+    "docs/internals.md",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "setup": "./install.sh"
+  }
+}
