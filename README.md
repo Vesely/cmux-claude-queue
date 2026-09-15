@@ -3,7 +3,9 @@
 Queue your next prompt for [Claude Code](https://claude.com/claude-code) with one keypress, and
 have it arrive as a fresh turn — after the current one has actually finished.
 
-![Opt+Enter queues a prompt mid-turn; it is delivered once the turn ends](docs/demo.gif)
+![Option+Enter queues "now update the README" while Claude is still working; the statusline holds it, and it is submitted as a new turn once the first one finishes](docs/demo.gif)
+
+<sub>`Option+Enter` instead of `Enter`: the draft leaves the box, waits in the statusline, and arrives as its own turn.</sub>
 
 macOS · [cmux](https://cmux.io) · MIT
 
