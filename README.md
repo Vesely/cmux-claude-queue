@@ -8,6 +8,7 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/cmux-claude-queue"><img src="https://img.shields.io/npm/v/cmux-claude-queue" alt="npm version"></a>
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey" alt="macOS only">
+  <a href="https://github.com/manaflow-ai/cmux"><img src="https://img.shields.io/badge/requires-cmux-black" alt="requires cmux"></a>
 </p>
 
 <p align="center">
