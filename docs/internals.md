@@ -5,9 +5,9 @@ see the [README](../README.md).
 
 ## The problem it works around
 
-Claude Code cannot intercept mid-turn input — messages typed while a turn runs bypass all of
-its hooks, and steering messages never fire `UserPromptSubmit`. So the queue operates one level
-below, on the terminal itself, through cmux's control socket.
+Hooks cannot intercept mid-turn input — a message Claude Code consumes mid-turn bypasses them
+all, and steering messages never fire `UserPromptSubmit`. So the queue operates one level below,
+on the terminal itself, through cmux's control socket.
 
 ```
 Opt+Enter
@@ -33,8 +33,8 @@ hotkeyd ──warm socket──▶ read box ─▶ <surfaceId>.<ms>.spool ─▶
 ## Components
 
 - **`hotkeyd/main.swift`** — the daemon. Registers Opt+Return (capture) and Opt+Shift+Return
-  (queue manager) via Carbon `RegisterEventHotKey` *only while cmux is frontmost*, so no
-  Accessibility permission is needed and both combos behave normally in every other app. It
+  (queue manager) via Carbon `RegisterEventHotKey` (no Accessibility permission needed), and
+  *only while cmux is frontmost*, so both combos behave normally in every other app. It
   performs the capture in-process over one warm authenticated control-socket connection:
   resolve the session, read the box, spool the draft, clear the box. Spawning a helper for that
   used to cost 100–500 ms of `fork`/`exec` plus interpreter startup before anything visible
@@ -75,7 +75,7 @@ each Claude session has its own queue.
   transcript, which matches the prompt in full at any length, bounded by a timestamp so a
   deliberate repeat is not confirmed by its predecessor. The scan stops after 64 MiB; past that,
   or when the transcript is missing, cmux's `workspace.prompt.submitted` event is the fallback,
-  because its 240-character preview does not saturate the way `tool_input_length` does. Slash commands emit no submit event at all,
+  because its 240-character preview still identifies a long prompt. Slash commands emit no submit event at all,
   so they are confirmed by the input box clearing instead.
 - **Bounded resends.** A send whose text left the input box is treated as in flight — neither
   re-sent nor counted against the retry cap — because Claude Code's own mid-turn queue swallows
@@ -104,9 +104,11 @@ every 15 s.
 
 - The hotkey daemon measured 0% CPU and ~25 MB RSS on the author's machine: Carbon hotkey plus
   app-activation callbacks, no event tap, no timers.
-- The capture hot path creates no processes at all. The resident daemon holds one warm
-  authenticated socket, so the sequence is a handful of round trips: ~5 ms workspace lookup,
-  ~1.2 ms per screen read, ~1 ms for the clear, against 3.9 ms of one-time connect and auth.
+- Nothing is spawned before the box is clear. The resident daemon holds one warm authenticated
+  socket, so the sequence is a handful of round trips, measured here at ~5 ms for the workspace
+  lookup, ~1.2 ms per screen read and ~1 ms for the clear, against 3.9 ms of one-time connect and
+  auth. Those are medians: sampling `workspace.current` 900 times also gave a p99 of ~90 ms and a
+  580 ms maximum when cmux's socket thread was busy.
 - The statusline wrapper's hot path is bash builtins almost end to end — the payload is parsed
   with substring expansion, the session→surface lookup is a cached one-line file read. The queue
   row starts `python3` only in the session that owns a non-empty queue.
@@ -116,7 +118,7 @@ every 15 s.
   With many sessions open, caching the chain cuts how often it runs at all.
 - The notification hook reads the payload with `cat` and echoes it straight back for every foreign
   notification, before doing any work of its own, so it adds no visible delay.
-- Delivery attempts are triggered by turn-complete notifications and by the statusline retry tick
+- Delivery attempts are triggered by every cmux notification and by the statusline retry tick
   (one per 15 s, only while a queue is non-empty). With every queue empty the tool schedules no
   work of its own, though Claude Code still runs the statusline on its refresh interval.
 
@@ -126,8 +128,8 @@ Claude Code's Ctrl+G (`chat:externalEditor`) writes the current draft to a temp 
 `$EDITOR` on it, and restores the box from the file when the editor exits. Pointing that at the
 queue turns Ctrl+G into a higher-fidelity capture gesture:
 
-1. `~/.claude/settings.json`: `"env": { "EDITOR": "~/.local/bin/cmux-claude-queue-editor" }`
-   (expanded path).
+1. `~/.claude/settings.json`: `"env": { "EDITOR": "/Users/<you>/.local/bin/cmux-claude-queue-editor" }`
+   — the `env` block does not expand `~`.
 2. Save your real editor for passthrough:
    `echo "zed" > ~/.config/cmux-claude-queue/real-editor`.
 
@@ -149,7 +151,8 @@ lets the TUI restore the unedited file.
 It works mid-turn and never touches focus. It is not installed for you — copy it yourself:
 
 ```sh
-install -m 755 extras/qq ~/.local/bin/qq
+install -m 755 extras/qq ~/.local/bin/qq                              # from a clone
+install -m 755 "$(npm root -g)/cmux-claude-queue/extras/qq" ~/.local/bin/qq   # from npm
 ```
 
 The shell parses the text first, so unbalanced quotes, `$` and backticks will not survive.

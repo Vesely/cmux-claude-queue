@@ -34,10 +34,11 @@ This tool keeps the draft outside Claude Code, on disk, one queue per cmux surfa
 only once the session looks idle — a `Stop` hook event, or a silent session plus an idle
 screen — and it checks the prompt arrived before dropping it from the queue.
 
-Requested in
-[#50246](https://github.com/anthropics/claude-code/issues/50246) (205 👍),
-[#33323](https://github.com/anthropics/claude-code/issues/33323),
-[#30677](https://github.com/anthropics/claude-code/issues/30677) and
+The 205-👍 request for a queue,
+[#50246](https://github.com/anthropics/claude-code/issues/50246), was closed when the native one
+shipped. The thread carried on anyway: *"half of the time claude read them before finishing
+current task … This makes it super unreliable."* Still open:
+[#33323](https://github.com/anthropics/claude-code/issues/33323) and
 [#63190](https://github.com/anthropics/claude-code/issues/63190).
 
 ## Use it
@@ -73,7 +74,7 @@ your paths filled in. It does not edit either file for you.
 **3. Paste the Claude Code snippet** into `~/.claude/settings.json`.
 
 Already have a statusline command? Save it as `~/.config/cmux-claude-queue/statusline-chain`
-first. It keeps running, and the queue row is appended below its output.
+first. Its output is cached for 180 s, and the queue row is appended below it.
 
 > **Password mode.** Step 2 turns on socket password control, so any process that can read your
 > `cmux.json` can drive your cmux terminals. Check the file is `chmod 600`. This is a wider gate
@@ -101,7 +102,8 @@ cd cmux-claude-queue && ./install.sh
 ```
 
 A clone is copied into `~/.local/bin`, so re-run `./install.sh` after a `git pull`. An npm
-install is symlinked, so `npm update -g` takes effect without re-running setup.
+install is symlinked, so `npm update -g` updates the scripts — but not the compiled daemon.
+Re-run `cmux-claude-queue-setup` for that.
 
 </details>
 
@@ -111,23 +113,29 @@ install is symlinked, so `npm update -g` takes effect without re-running setup.
 - Newlines in a draft become spaces. Queued prompts are stored one per line.
 - A cmux restart regenerates surface ids. Anything still queued stays under the old id in
   `~/.claude/prompt-queue/` and is not delivered.
-- Delivery gives up after three unconfirmed attempts and notifies you, rather than resending
-  forever. The text is left in the input box, so nothing is lost, but you press `Enter` yourself.
+- Delivery stops after three unconfirmed sends and notifies you, rather than resending forever.
+  The text survives — in the input box, the queue or the log — but you finish it yourself.
+- Every queued prompt is also written to `~/.claude/prompt-queue/log.txt`, which is never
+  rotated. That log is how a parked prompt is recovered, so check it before sharing it.
 - cmux only. Ghostty has no capture backend.
 
 ## Uninstall
 
+Your previous statusline command is in `~/.config/cmux-claude-queue/statusline-chain`. Copy it
+back into Claude Code's `settings.json` before you delete that directory.
+
 ```sh
 launchctl bootout gui/$(id -u)/com.cmux-claude-queue.hotkeyd
-rm ~/Library/LaunchAgents/com.cmux-claude-queue.hotkeyd.plist
+rm -f ~/Library/LaunchAgents/com.cmux-claude-queue.hotkeyd.plist
 rm -f ~/.local/bin/cmux-claude-queue ~/.local/bin/cmux-claude-queue-hotkeyd \
-      ~/.local/bin/cmux-claude-queue-editor
+      ~/.local/bin/cmux-claude-queue-editor ~/.local/bin/qq
 rm -rf ~/.claude/prompt-queue ~/.config/cmux-claude-queue
 npm uninstall -g cmux-claude-queue   # if installed from npm
 ```
 
-Then remove the `notifications.hooks` entry from `cmux.json` and restore your previous
-`statusLine` in Claude Code's `settings.json`.
+Then, by hand: remove `notifications.hooks` from `cmux.json`, restore `statusLine` and drop any
+`env.EDITOR` entry in `settings.json`, and — if you turned it on only for this — put
+`automation.socketControlMode` back to `cmuxOnly` and delete `automation.socketPassword`.
 
 ## Internals
 

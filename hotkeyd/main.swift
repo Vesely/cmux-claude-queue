@@ -81,7 +81,7 @@ func qlog(_ msg: String) {
     // time, and a seek+write loses whatever landed in between. The log is not
     // just diagnostics — a prompt dropped after three unconfirmed sends
     // survives only as its line in here.
-    let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
     guard fd >= 0 else { return }
     defer { close(fd) }
     _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
@@ -600,6 +600,8 @@ final class FastCapture {
               let body = (headLine + "\n" + dump).data(using: .utf8) else { return nil }
         do {
             try body.write(to: URL(fileURLWithPath: tmp))
+            // the dump is the whole visible screen, so keep it to this account
+            chmod(tmp, 0o600)
             try FileManager.default.moveItem(atPath: tmp, toPath: final)
         } catch {
             try? FileManager.default.removeItem(atPath: tmp)

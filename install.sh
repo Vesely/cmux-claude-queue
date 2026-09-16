@@ -34,12 +34,16 @@ LABEL="com.cmux-claude-queue.hotkeyd"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 STATE_DIR="$HOME/.claude/prompt-queue"
 
-command -v swiftc >/dev/null 2>&1 || {
+# /usr/bin/swiftc always exists — it is Apple's xcode-select shim, the same inode as
+# /usr/bin/git. Only xcrun can tell us whether the real toolchain is behind it.
+xcrun --find swiftc >/dev/null 2>&1 || {
   echo "error: swiftc not found — install the Xcode Command Line Tools first (xcode-select --install)" >&2
   exit 1
 }
 
-mkdir -p "$BIN_DIR" "$STATE_DIR" "$HOME/Library/LaunchAgents"
+mkdir -p "$BIN_DIR" "$HOME/Library/LaunchAgents"
+# drafts, screen dumps and the prompt log live here — keep them to this account
+mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 
 if [ "$MODE" = "link" ]; then
   echo "==> linking $BIN_DIR/cmux-claude-queue (edits to $REPO go live)"
