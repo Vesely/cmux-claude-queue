@@ -145,14 +145,14 @@ back into Claude Code's `settings.json` before you delete that directory.
 launchctl bootout gui/$(id -u)/com.cmux-claude-queue.hotkeyd
 rm -f ~/Library/LaunchAgents/com.cmux-claude-queue.hotkeyd.plist
 rm -f ~/.local/bin/cmux-claude-queue ~/.local/bin/cmux-claude-queue-hotkeyd \
-      ~/.local/bin/cmux-claude-queue-editor ~/.local/bin/qq
+      ~/.local/bin/qq
 rm -rf ~/.claude/prompt-queue ~/.config/cmux-claude-queue
 npm uninstall -g cmux-claude-queue   # if installed from npm
 ```
 
-Then, by hand: remove `notifications.hooks` from `cmux.json`, restore `statusLine` and drop any
-`env.EDITOR` entry in `settings.json`, and — if you turned it on only for this — put
-`automation.socketControlMode` back to `cmuxOnly` and delete `automation.socketPassword`.
+Then, by hand: remove `notifications.hooks` from `cmux.json`, restore `statusLine` in
+`settings.json`, and — if you turned it on only for this — put `automation.socketControlMode`
+back to `cmuxOnly` and delete `automation.socketPassword`.
 
 ## Internals
 

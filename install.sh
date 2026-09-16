@@ -48,12 +48,10 @@ mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 if [ "$MODE" = "link" ]; then
   echo "==> linking $BIN_DIR/cmux-claude-queue (edits to $REPO go live)"
   ln -sf "$REPO/bin/cmux-claude-queue" "$BIN_DIR/cmux-claude-queue"
-  ln -sf "$REPO/bin/cmux-claude-queue-editor" "$BIN_DIR/cmux-claude-queue-editor"
 else
   # a copy survives the clone being moved or deleted; --dev symlinks instead
   echo "==> installing $BIN_DIR/cmux-claude-queue"
   install -m 755 "$REPO/bin/cmux-claude-queue" "$BIN_DIR/cmux-claude-queue"
-  install -m 755 "$REPO/bin/cmux-claude-queue-editor" "$BIN_DIR/cmux-claude-queue-editor"
 fi
 
 echo "==> building $BIN_DIR/cmux-claude-queue-hotkeyd"

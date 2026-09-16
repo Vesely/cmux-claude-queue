@@ -125,29 +125,6 @@ every 15 s.
   (one per 15 s, only while a queue is non-empty). With every queue empty the tool schedules no
   work of its own, though Claude Code still runs the statusline on its refresh interval.
 
-## External-editor capture
-
-Claude Code's Ctrl+G (`chat:externalEditor`) writes the current draft to a temp file, opens
-`$EDITOR` on it, and restores the box from the file when the editor exits. Pointing that at the
-queue turns Ctrl+G into a higher-fidelity capture gesture:
-
-1. `~/.claude/settings.json`: `"env": { "EDITOR": "/Users/<you>/.local/bin/cmux-claude-queue-editor" }`
-   — the `env` block does not expand `~`.
-2. Save your real editor for passthrough:
-   `echo "zed" > ~/.config/cmux-claude-queue/real-editor`.
-
-For sessions started after the change, **Ctrl+G during a running turn** queues the draft without
-scraping the screen at all: the text comes from the file the TUI wrote, so wrapping, width and
-rendering cannot corrupt it, and the box clears natively when the TUI restores the emptied file.
-**Ctrl+G on an idle session** passes through to your real editor, as does every other use of
-`$EDITOR` inside a session (`git commit` from `!` bash mode, for instance).
-
-It does not preserve line breaks. Queued prompts are stored one per line, so the editor path runs
-`tr '\n' ' '` on the file before appending it, exactly as the screen path does.
-
-The passthrough editor must block: `zed --wait`, not plain `zed`, which exits immediately and
-lets the TUI restore the unedited file.
-
 ## `!qq` — queue from bash mode
 
 `extras/qq` queues a prompt from inside Claude Code's `!` bash mode: `!qq fix the tests next`.

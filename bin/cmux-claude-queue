@@ -2219,61 +2219,6 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     [ "$(lifecycle "$surface")" != "running" ] && deliver_once "$surface"
     ;;
 
-  editor)
-    # External-editor capture (invoked via the cmux-claude-queue-editor shim
-    # set as a session's $EDITOR): Claude Code's Ctrl+G writes the draft to a
-    # temp file, spawns $EDITOR and restores the box from the file on exit.
-    # That makes this the highest-fidelity capture path — the TUI hands over
-    # the EXACT draft (real newlines, no screen scrape) and truncating the
-    # file clears the box natively, at native speed. Anything that is not a
-    # Claude prompt file (git commit from ! bash mode, any other EDITOR use)
-    # passes through to the real editor untouched, as does an idle-session
-    # Ctrl+G — that is a genuine editing intent, not a queueing one.
-    file="${2:-}"
-    real=$(cat "$HOME/.config/cmux-claude-queue/real-editor" 2>/dev/null || true)
-    [ -z "$real" ] && real="${CMUX_CLAUDE_QUEUE_REAL_EDITOR:-vi}"
-    surface="${CMUX_SURFACE_ID:-}"
-    passthrough=""
-    case "$(basename "${file:-x}")" in
-      claude-prompt-*.md) : ;;
-      *) passthrough=1 ;;
-    esac
-    { [ -z "$surface" ] || [ ! -f "$file" ]; } && passthrough=1
-    if [ -z "$passthrough" ]; then
-      ctx=$(session_state "$surface")
-      verdict=${ctx#*$'\x1f'}
-      # idle -> real editor; running AND stale both queue: stale is usually a
-      # long tool-less streaming stretch, and even a mis-queued idle draft is
-      # only delayed a few seconds (the pump submits it), never lost
-      [ "$verdict" = "idle" ] && passthrough=1
-    fi
-    if [ -n "$passthrough" ]; then
-      shift
-      # $real intentionally unquoted: it may carry flags ("zed --wait")
-      exec $real "$@"
-    fi
-    text=$(tr '\n' ' ' < "$file")
-    text="${text#"${text%%[![:space:]]*}"}"
-    text="${text%"${text##*[![:space:]]}"}"
-    if [ -n "$text" ]; then
-      if qlock_take "$surface"; then
-        [ -s "$QDIR/$surface.queue" ] \
-          || wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
-        printf '%s\n' "$text" >> "$QDIR/$surface.queue"
-        qlock_drop "$surface"
-      else
-        printf '%s\n' "$text" >> "$QDIR/$surface.queue"
-      fi
-      log "editor-capture surface=$surface queued: $text"
-      # insurance tick in the background: Claude Code waits for this process
-      # to exit before it restores (= clears) the box, so exit must be quick
-      ( "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick \
-          --surface "$surface" >/dev/null 2>&1 & )
-    fi
-    : > "$file"
-    exit 0
-    ;;
-
   enqueue)
     # append only, no delivery attempt — for callers that must never inject
     # keystrokes themselves (e.g. qq running as a deferred ! command)

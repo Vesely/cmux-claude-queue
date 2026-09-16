@@ -1,5 +1,0 @@
-#!/bin/bash
-# EDITOR shim for cmux-claude-queue's external-editor capture. EDITOR is
-# spawned as a single word by most callers, so the editor mode needs its own
-# executable; everything else lives in the main script's `editor` arm.
-exec "$(dirname "$0")/cmux-claude-queue" editor "$@"
