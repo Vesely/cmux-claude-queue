@@ -681,6 +681,13 @@ private func configuredHotkey(_ path: String, _ fallback: String) -> (UInt32, UI
 private func currentHotkeys() -> [Hotkey] {
     let capture = configuredHotkey(Paths.hotkeyCapture, "opt+enter")
     let manage = configuredHotkey(Paths.hotkeyManage, "opt+shift+enter")
+    // Registering the same combo twice fails the second one with
+    // eventHotKeyExistsErr, and the only symptom is a manager that never
+    // opens. Say so rather than leaving it to be discovered.
+    if capture == manage {
+        FileHandle.standardError.write(Data(
+            "capture and manage are set to the same combo; the manager will not register\n".utf8))
+    }
     return [
         Hotkey(id: 1, keyCode: capture.0, modifiers: capture.1, action: "capture", sound: true),
         // the manager pane is its own visible feedback, no sound needed

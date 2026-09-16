@@ -54,6 +54,17 @@ else
   install -m 755 "$REPO/bin/cmux-claude-queue" "$BIN_DIR/cmux-claude-queue"
 fi
 
+# v1 installed an $EDITOR shim for the external-editor capture. That path is
+# gone; leaving the file behind means Ctrl+G execs a command that no longer
+# has an `editor` subcommand, and an npm upgrade leaves it dangling anyway.
+if [ -e "$BIN_DIR/cmux-claude-queue-editor" ] || [ -L "$BIN_DIR/cmux-claude-queue-editor" ]; then
+  rm -f "$BIN_DIR/cmux-claude-queue-editor"
+  echo "==> removed the old editor shim (external-editor capture was dropped)"
+  if grep -q 'cmux-claude-queue-editor' "$HOME/.claude/settings.json" 2>/dev/null; then
+    echo "    NOTE: ~/.claude/settings.json still sets EDITOR to it — remove that entry" >&2
+  fi
+fi
+
 echo "==> building $BIN_DIR/cmux-claude-queue-hotkeyd"
 swiftc -O "$REPO/hotkeyd/main.swift" -o "$BIN_DIR/cmux-claude-queue-hotkeyd"
 

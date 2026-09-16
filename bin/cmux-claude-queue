@@ -900,6 +900,15 @@ esac
 # Size of cmux's event log, 0 before cmux has ever written one. A bare
 # `wc -c < "$EVENTS"` makes bash itself report the failed redirection, and no
 # 2>/dev/null on the command can suppress that.
+# Surface ids are cmux uuids and become filenames. A mistyped one with a
+# slash or a ".." would address files outside the queue directory.
+valid_surface() {
+  case "${1:-}" in
+    ''|*/*|*..*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 events_size() {
   if [ -f "$EVENTS" ]; then wc -c < "$EVENTS" 2>/dev/null || echo 0; else echo 0; fi
 }
@@ -1249,9 +1258,12 @@ transcript_path() {
 # so a plain function definition cannot be shared between them; this is
 # injected into each heredoc instead, via an env var and exec().
 IFS= read -r -d '' TRANSCRIPT_MATCH_PY <<'PYFRAG' || :
+# 0 = found, 1 = definitively not there (the whole file, or everything back
+# past `since`, was read), 2 = no answer (missing, unreadable, or the scan hit
+# MAX_SCAN first). Only 2 may fall through to the workspace-wide event check.
 def transcript_match(path, want, since):
     if not path:
-        return False
+        return 2
     # The prefilter runs against the RAW json line, where the prompt text is
     # escaped. Built from the unescaped text it could never match a prompt
     # holding a quote (or a backslash, or a newline) in its first 60 bytes:
@@ -1312,7 +1324,7 @@ def transcript_match(path, want, since):
                     except Exception:
                         continue
                     if ts >= since:
-                        return True
+                        return 0
                 # entries are appended in time order, so the first timestamp
                 # in a block is the oldest in it: one find and one compare
                 # per 4 MiB decides whether anything older can still qualify
@@ -1321,8 +1333,9 @@ def transcript_match(path, want, since):
                     if i >= 0 and block[i + 13:i + 13 + len(since_iso)] < since_iso:
                         break
     except Exception:
-        return False
-    return False
+        return 2
+    # out of budget with file left unread is not the same as "not there"
+    return 2 if (scanned >= MAX_SCAN and pos > 0) else 1
 PYFRAG
 
 # The workspace a session belongs to, from the cmux hook store.
@@ -1392,8 +1405,9 @@ PY
 # The timestamp bound is what makes it safe: the same text may well have been
 # sent before (a repeat is ordinary), and confirming on an older copy would
 # pop a line that never ran.
-# 0 = confirmed, 1 = the transcript was readable and does not contain it,
-# 2 = there is no transcript to ask. Only 2 may fall back to preview_confirm.
+# 0 = confirmed, 1 = the transcript was read and does not contain it, 2 = the
+# transcript could not answer (missing, unreadable, or bigger than the scan
+# budget). Only 2 may fall back to preview_confirm.
 transcript_confirm() {
   local tf
   tf=$(transcript_path "$1") || return 2
@@ -1401,7 +1415,7 @@ transcript_confirm() {
 import datetime, json, os, sys
 exec(os.environ["TRANSCRIPT_MATCH_PY"])
 path, want, since = sys.argv[1], sys.argv[2], float(sys.argv[3])
-sys.exit(0 if transcript_match(path, want, since) else 1)
+sys.exit(transcript_match(path, want, since))
 PY
 }
 
@@ -1503,7 +1517,7 @@ lens = {len(json.dumps({"prompt": text}, separators=(",", ":"))),
 deadline = time.monotonic() + 6.0
 pos = offset
 while True:
-    if transcript_match(tpath, text, since):
+    if transcript_match(tpath, text, since) == 0:
         sys.exit(0)
     try:
         with open(events, "rb") as f:
@@ -2068,12 +2082,18 @@ USAGE
       [ -s "$qf" ] || continue
       found=1
       surf=$(basename "$qf" .queue)
-      printf '\033[1m%s\033[0m  (%s queued)\n' "$surf" "$(wc -l < "$qf" | tr -d ' ')"
-      n=0
-      while IFS= read -r l; do
-        n=$((n + 1))
-        printf '  %2d  %s\n' "$n" "$l"
-      done < "$qf"
+      # one read: delivery pops by atomic rename, so a second open here could
+      # show a body that disagrees with the count above it
+      body=$(cat "$qf" 2>/dev/null) || continue
+      [ -n "$body" ] || continue
+      printf '\033[1m%s\033[0m  (%s queued)\n' "$surf" "$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+      printf '%s\n' "$body" | {
+        n=0
+        while IFS= read -r l; do
+          n=$((n + 1))
+          printf '  %2d  %s\n' "$n" "$l"
+        done
+      }
       [ -f "$QDIR/$surf.parked" ] && printf '      \033[2m(delivery parked, see log.txt)\033[0m\n'
       printf '\n'
     done
@@ -2083,6 +2103,7 @@ USAGE
 
   clear)
     surface="${2:?usage: cmux-claude-queue clear <surfaceId>}"
+    valid_surface "$surface" || { echo "clear: not a surface id: $surface" >&2; exit 1; }
     qf="$QDIR/$surface.queue"
     [ -s "$qf" ] || { echo "nothing queued for $surface"; exit 0; }
     n=$(wc -l < "$qf" | tr -d ' ')
@@ -2093,6 +2114,12 @@ USAGE
       qlock_drop "$surface"
       log "clear surface=$surface dropped $n queued"
       echo "dropped $n queued for $surface"
+      # the queue lock only stops the next pop; a deliverer already holding
+      # its own lock has picked a line up and its keystrokes are on the way
+      if [ -L "$QDIR/$surface.lock" ] \
+         && kill -0 "$(readlink "$QDIR/$surface.lock" 2>/dev/null)" 2>/dev/null; then
+        echo "a delivery was already in flight — the prompt it picked up may still arrive" >&2
+      fi
     else
       echo "could not take the queue lock for $surface — try again" >&2
       exit 1
@@ -2274,6 +2301,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
 
   add)
     surface="${2:?usage: cmux-claude-queue add <surfaceId> <text>}"
+    valid_surface "$surface" || { echo "add: not a surface id: $surface" >&2; exit 1; }
     shift 2
     # queue format is one message per line: an embedded newline would split
     # one prompt into several deliveries
@@ -2297,6 +2325,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # append only, no delivery attempt — for callers that must never inject
     # keystrokes themselves (e.g. qq running as a deferred ! command)
     surface="${2:?usage: cmux-claude-queue enqueue <surfaceId> <text>}"
+    valid_surface "$surface" || { echo "enqueue: not a surface id: $surface" >&2; exit 1; }
     shift 2
     text=$(printf '%s' "$*" | tr '\n' ' ')
     # deliver_once returns without popping a blank line, so one sitting ahead
@@ -2315,6 +2344,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
 
   drain)
     surface="${2:?usage: cmux-claude-queue drain <surfaceId>}"
+    valid_surface "$surface" || { echo "drain: not a surface id: $surface" >&2; exit 1; }
     end=$((SECONDS + 14400))
     while [ "$SECONDS" -lt "$end" ]; do
       [ -s "$QDIR/$surface.queue" ] || break
