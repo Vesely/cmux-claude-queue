@@ -50,7 +50,8 @@ current task … This makes it super unreliable."* Still open:
 | `Option+Shift+Enter` | Opens the queue manager: `↑↓` select, `e` edit, `d` delete, `q` close |
 
 On an idle session `Option+Enter` acts like plain `Enter`. Each cmux surface has its own FIFO
-queue, and delivery targets that same surface.
+queue and delivery targets that same surface — but the capture picks the *active* Claude surface
+in the current workspace, so keep one Claude session per workspace.
 
 Both shortcuts are registered only while cmux is frontmost, so they behave normally everywhere
 else. From a shell, `cmux-claude-queue list` shows everything queued and
