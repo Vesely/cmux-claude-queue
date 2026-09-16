@@ -74,27 +74,23 @@ The change applies the next time cmux comes to the front. No restart, and nothin
 
 ## Setup
 
-Needs macOS, [cmux](https://github.com/manaflow-ai/cmux) ≥ 0.64.20, Claude Code, `python3`, and
-the Xcode Command Line Tools for `swiftc`.
-
-**1. Install**
+Needs macOS, [cmux](https://github.com/manaflow-ai/cmux) ≥ 0.64.20, Claude Code, and the Xcode
+Command Line Tools (`xcode-select --install`).
 
 ```sh
 npm i -g cmux-claude-queue
-cmux-claude-queue-setup
+cmux-claude-queue setup
 ```
 
-`setup` builds the hotkey daemon, loads its LaunchAgent, and prints two config snippets with
-your paths filled in. It does not edit either file for you.
-
-**2. Paste the cmux snippet** into `~/.config/cmux/cmux.json`, then run `cmux reload-config`.
-
-**3. Paste the Claude Code snippet** into `~/.claude/settings.json`.
+`setup` builds the hotkey daemon and loads its LaunchAgent, then prints two config snippets with
+your paths already filled in — one for `~/.config/cmux/cmux.json`, one for
+`~/.claude/settings.json`. Paste both, run `cmux reload-config`, and you are done. It never edits
+either file for you.
 
 Already have a statusline command? Save it as `~/.config/cmux-claude-queue/statusline-chain`
 first. Its output is cached for 180 s, and the queue row is appended below it.
 
-> **Password mode.** Step 2 turns on socket password control, so any process that can read your
+> **Password mode.** The cmux snippet turns on socket password control, so any process that can read your
 > `cmux.json` can drive your cmux terminals. Check the file is `chmod 600`. This is a wider gate
 > than cmux's default `cmuxOnly` mode, which rejects the hotkey daemon because the daemon is not
 > a cmux child process.
@@ -104,7 +100,7 @@ first. Its output is cached for 180 s, and the queue row is appended below it.
 
 Paste this into Claude Code:
 
-> Install cmux-claude-queue: run `npm i -g cmux-claude-queue && cmux-claude-queue-setup`, apply
+> Install cmux-claude-queue: run `npm i -g cmux-claude-queue && cmux-claude-queue setup`, apply
 > the two snippets it prints to `~/.config/cmux/cmux.json` and `~/.claude/settings.json`, move
 > any existing statusLine command to `~/.config/cmux-claude-queue/statusline-chain` first, then
 > run `cmux reload-config` and tell me what you changed.
@@ -120,8 +116,8 @@ cd cmux-claude-queue && ./install.sh
 ```
 
 A clone is copied into `~/.local/bin`, so re-run `./install.sh` after a `git pull`. An npm
-install is symlinked, so `npm update -g` updates the scripts — but not the compiled daemon.
-Re-run `cmux-claude-queue-setup` for that.
+install is symlinked, so `npm update -g` updates the script — but not the compiled daemon.
+Re-run `cmux-claude-queue setup` for that.
 
 </details>
 

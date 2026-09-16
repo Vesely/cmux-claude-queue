@@ -2374,8 +2374,33 @@ open(sys.argv[2], "w").write(text)' "${items[$sel]}" "$edtmp" </dev/tty >/dev/tt
     exit 0
     ;;
 
+  setup)
+    # Build the daemon and print the config snippets. The installer lives in
+    # the package directory, one level up from this script — reachable when
+    # the installed command is a symlink into a node_modules copy or a clone,
+    # which is every install except `--copy`. A copy has no package beside it
+    # and nothing to build main.swift from, so it is pointed at its clone
+    # rather than guessed at.
+    self="$0"
+    while [ -L "$self" ]; do
+      target=$(readlink "$self")
+      case "$target" in
+        /*) self="$target" ;;
+        *)  self="$(dirname "$self")/$target" ;;
+      esac
+    done
+    pkg=$(cd "$(dirname "$self")/.." 2>/dev/null && pwd || true)
+    if [ -n "$pkg" ] && [ -x "$pkg/install.sh" ]; then
+      shift
+      exec "$pkg/install.sh" "$@"
+    fi
+    echo "setup: no package directory beside $self" >&2
+    echo "This is a standalone copy; run ./install.sh from your clone instead." >&2
+    exit 1
+    ;;
+
   *)
-    echo "usage: cmux-claude-queue [capture|statusline|notifyhook|add <surface> <text>|manage-open|drain <surface>]"
+    echo "usage: cmux-claude-queue [setup|capture|statusline|notifyhook|add <surface> <text>|manage-open|drain <surface>]"
     exit 1
     ;;
 esac
