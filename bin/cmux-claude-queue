@@ -51,6 +51,9 @@
 #        ~/.claude/prompt-queue/<surfaceId>.<epochMs>.spool (in-flight capture)
 
 set -u
+# drafts, whole-screen dumps and the prompt log all live under $QDIR;
+# nothing this script writes is meant for another account to read
+umask 077
 
 QDIR="$HOME/.claude/prompt-queue"
 STORE="$HOME/.cmuxterm/claude-hook-sessions.json"
@@ -75,7 +78,7 @@ CLOSE_TAB=""
 case " $* " in *" --close-tab "*) CLOSE_TAB="${CMUX_SURFACE_ID:-}" ;; esac
 export CMUX_CLAUDE_QUEUE_CLOSE_TAB="$CLOSE_TAB"
 
-case "${1:-capture}" in
+case "${1:-help}" in
   statusline)
     # Claude Code statusLine command: if the user had their own statusline
     # command before installing, it lives in the chain file (a shell script
@@ -894,6 +897,13 @@ esac
 # maintains from cmux.json), so even callers with no cmux env at all — the
 # hotkey daemon, detached shells — authenticate without us spawning anything.
 
+# Size of cmux's event log, 0 before cmux has ever written one. A bare
+# `wc -c < "$EVENTS"` makes bash itself report the failed redirection, and no
+# 2>/dev/null on the command can suppress that.
+events_size() {
+  if [ -f "$EVENTS" ]; then wc -c < "$EVENTS" 2>/dev/null || echo 0; else echo 0; fi
+}
+
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$QDIR/log.txt"; }
 
 # agentLifecycle of the session active on a surface: running | idle | needsInput | unknown
@@ -1436,7 +1446,7 @@ confirm_submit() {
   [ "$tc" -eq 2 ] && preview_confirm "$sid" "$line" "$since" && return 0
   # a rotated event log (cmux renames it to events.jsonl.1 at 16 MB) leaves
   # every stored offset past the end of the new file, where tail reads nothing
-  [ "$offset" -gt "$(wc -c < "$EVENTS" 2>/dev/null || echo 0)" ] 2>/dev/null && offset=0
+  [ "$offset" -gt "$(events_size)" ] 2>/dev/null && offset=0
   tail -c "+$((offset + 1))" "$EVENTS" 2>/dev/null | python3 -c '
 import json, sys
 sid, text, mode = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -1724,7 +1734,7 @@ deliver_once() {
       pop_head "$surface" "$line" \
         && rm -f "$afile" "$QDIR/$surface.sends" "$QDIR/$surface.parked" \
                  "$QDIR/$surface.leftover" "$QDIR/$surface.holdoff"
-      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+      events_size > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
     rm -rf "$lock"
@@ -1744,7 +1754,7 @@ deliver_once() {
       pop_head "$surface" "$line"
       rm -f "$QDIR/$surface.sends" "$QDIR/$surface.parked" \
             "$QDIR/$surface.leftover" "$QDIR/$surface.holdoff"
-      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+      events_size > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
     rm -rf "$lock"
@@ -1871,7 +1881,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   fi
   { printf '%s\n' "$scount"; printf '%s\n' "$line"; } > "$sfile"
 
-  offset=$(wc -c < "$EVENTS" 2>/dev/null || echo 0)
+  offset=$(events_size)
   "$CMUX_BIN" send --surface "$surface" $'\x15' >>"$QDIR/log.txt" 2>&1 || {
     # surface gone or rejecting input (cmux restart, closed pane): skip the
     # whole confirm cycle instead of burning ~7 s against it every tick
@@ -1910,7 +1920,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
         log "deliver surface=$surface parked after $dcount diverges, text left in box: $line"
         if qlock_take "$surface"; then
           pop_head "$surface" "$line"
-          wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+          events_size > "$QDIR/$surface.qoffset" 2>/dev/null
           qlock_drop "$surface"
         fi
         rm -f "$dfile" "$QDIR/$surface.leftover"
@@ -1956,7 +1966,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
         || log "deliver surface=$surface pop failed or head changed, next tick will late-confirm"
       # advance the enqueue offset past our own submit, so an identical line
       # queued next (intentional repeat) is not swallowed as already-sent
-      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+      events_size > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     else
       log "deliver surface=$surface pop skipped (queue busy), next tick will late-confirm"
@@ -2010,7 +2020,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     if qlock_take "$surface"; then
       pop_head "$surface" "$line" \
         && rm -f "$rfile"
-      wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+      events_size > "$QDIR/$surface.qoffset" 2>/dev/null
       qlock_drop "$surface"
     fi
     "$CMUX_BIN" notify --title "Queue" \
@@ -2023,9 +2033,73 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   return 1
 }
 
-cmd="${1:-capture}"
+cmd="${1:-help}"
 
 case "$cmd" in
+  help|-h|--help)
+    cat <<'USAGE'
+cmux-claude-queue — queue prompts for Claude Code running in cmux
+
+  setup [--dev]              build the hotkey daemon, print the config snippets
+  list                       show everything currently queued
+  clear <surface>            drop every prompt queued for one surface
+  capture                    take the draft out of the input box and queue it
+  add <surface> <text>       queue a prompt, then try to deliver it
+  enqueue <surface> <text>   queue a prompt without attempting delivery
+  drain <surface>            keep delivering until that queue is empty
+  manage-open                open the interactive queue manager in a new pane
+
+statusline and notifyhook are wired into Claude Code and cmux by setup; you
+do not run them yourself.
+
+Option+Enter queues the draft, Option+Shift+Enter opens the manager. Both are
+defaults — the README explains how to change them.
+
+https://github.com/Vesely/cmux-claude-queue
+USAGE
+    exit 0
+    ;;
+
+  list)
+    # Read-only view of every queue, for when you are not in the session that
+    # owns one. The manager (Option+Shift+Enter) edits; this only reports.
+    found=0
+    for qf in "$QDIR"/*.queue; do
+      [ -s "$qf" ] || continue
+      found=1
+      surf=$(basename "$qf" .queue)
+      printf '\033[1m%s\033[0m  (%s queued)\n' "$surf" "$(wc -l < "$qf" | tr -d ' ')"
+      n=0
+      while IFS= read -r l; do
+        n=$((n + 1))
+        printf '  %2d  %s\n' "$n" "$l"
+      done < "$qf"
+      [ -f "$QDIR/$surf.parked" ] && printf '      \033[2m(delivery parked, see log.txt)\033[0m\n'
+      printf '\n'
+    done
+    [ "$found" -eq 0 ] && echo "nothing queued"
+    exit 0
+    ;;
+
+  clear)
+    surface="${2:?usage: cmux-claude-queue clear <surfaceId>}"
+    qf="$QDIR/$surface.queue"
+    [ -s "$qf" ] || { echo "nothing queued for $surface"; exit 0; }
+    n=$(wc -l < "$qf" | tr -d ' ')
+    # take the lock first, or a delivery mid-pop writes the file back out
+    if qlock_take "$surface"; then
+      rm -f "$qf" "$QDIR/$surface.qoffset" "$QDIR/$surface.parked" \
+            "$QDIR/$surface.sends" "$QDIR/$surface.resend" "$QDIR/$surface.diverge"
+      qlock_drop "$surface"
+      log "clear surface=$surface dropped $n queued"
+      echo "dropped $n queued for $surface"
+    else
+      echo "could not take the queue lock for $surface — try again" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+
   capture)
     # Instant statusline feedback: mark a capture in flight before any of the
     # slow socket work. While this file is fresh the statusline shows a
@@ -2104,7 +2178,7 @@ case "$cmd" in
           # stood, so delivery can tell "this text was already submitted
           # after it was queued" apart from any older identical submit
           [ -s "$QDIR/$target.queue" ] \
-            || wc -c < "$EVENTS" > "$QDIR/$target.qoffset" 2>/dev/null
+            || events_size > "$QDIR/$target.qoffset" 2>/dev/null
           printf '%s\n' "$text" >> "$QDIR/$target.queue"
           qlock_drop "$target"
         else
@@ -2209,7 +2283,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     case "$text" in *[![:space:]]*) ;; *) log "refused a blank prompt for $surface"; exit 1 ;; esac
     if qlock_take "$surface"; then
       [ -s "$QDIR/$surface.queue" ] \
-        || wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+        || events_size > "$QDIR/$surface.qoffset" 2>/dev/null
       printf '%s\n' "$text" >> "$QDIR/$surface.queue"
       qlock_drop "$surface"
     else
@@ -2230,7 +2304,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     case "$text" in *[![:space:]]*) ;; *) log "refused a blank prompt for $surface"; exit 1 ;; esac
     if qlock_take "$surface"; then
       [ -s "$QDIR/$surface.queue" ] \
-        || wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
+        || events_size > "$QDIR/$surface.qoffset" 2>/dev/null
       printf '%s\n' "$text" >> "$QDIR/$surface.queue"
       qlock_drop "$surface"
     else
@@ -2400,7 +2474,8 @@ open(sys.argv[2], "w").write(text)' "${items[$sel]}" "$edtmp" </dev/tty >/dev/tt
     ;;
 
   *)
-    echo "usage: cmux-claude-queue [setup|capture|statusline|notifyhook|add <surface> <text>|manage-open|drain <surface>]"
+    echo "cmux-claude-queue: unknown command '$cmd'" >&2
+    echo "try: cmux-claude-queue help" >&2
     exit 1
     ;;
 esac

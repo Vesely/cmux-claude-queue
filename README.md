@@ -2,7 +2,7 @@
 
 <h4 align="center">
   Press <code>Option+Enter</code> instead of <code>Enter</code>.<br>
-  Your draft leaves the input box, waits on disk, and goes in as a new turn once the current one has ended.
+  A real queue, not steering: your prompt waits outside the session and is sent only once the running one has fully finished.
 </h4>
 
 <p align="center">
@@ -53,7 +53,8 @@ On an idle session `Option+Enter` acts like plain `Enter`. Each cmux surface has
 queue, and delivery targets that same surface.
 
 Both shortcuts are registered only while cmux is frontmost, so they behave normally everywhere
-else.
+else. From a shell, `cmux-claude-queue list` shows everything queued and
+`cmux-claude-queue clear <surface>` drops one queue; `cmux-claude-queue help` lists the rest.
 
 <details>
 <summary>Or pick your own keys</summary>
