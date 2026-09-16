@@ -143,4 +143,5 @@ You can register a cmux action running `cmux-claude-queue capture --close-tab` (
 target `newTabInCurrentPane`) to trigger a capture without the daemon. This opens a short-lived
 tab; the hotkey path does not. `--close-tab` is what makes the tab close again — without it the
 command leaves whatever surface it ran in alone, so running `cmux-claude-queue capture` by hand
-in a shell is safe.
+in a shell is safe. An action registered under 1.0.0 has no `--close-tab`, so add it or the tab
+it opens stays open.
