@@ -77,23 +77,38 @@ The change applies the next time cmux comes to the front. No restart, and nothin
 Needs macOS, [cmux](https://github.com/manaflow-ai/cmux) ≥ 0.64.20, Claude Code, and the Xcode
 Command Line Tools (`xcode-select --install`).
 
+**1. Install**
+
 ```sh
 npm i -g cmux-claude-queue
+```
+
+**2. Build the daemon**
+
+```sh
 cmux-claude-queue setup
 ```
 
-`setup` builds the hotkey daemon and loads its LaunchAgent, then prints two config snippets with
-your paths already filled in — one for `~/.config/cmux/cmux.json`, one for
-`~/.claude/settings.json`. Paste both, run `cmux reload-config`, and you are done. It never edits
-either file for you.
+It compiles the hotkey daemon, loads its LaunchAgent, and prints two config snippets with your
+paths already filled in.
 
-Already have a statusline command? Save it as `~/.config/cmux-claude-queue/statusline-chain`
-first. Its output is cached for 180 s, and the queue row is appended below it.
+**3. Paste the two snippets**
 
-> **Password mode.** The cmux snippet turns on socket password control, so any process that can read your
-> `cmux.json` can drive your cmux terminals. Check the file is `chmod 600`. This is a wider gate
-> than cmux's default `cmuxOnly` mode, which rejects the hotkey daemon because the daemon is not
-> a cmux child process.
+One belongs in `~/.config/cmux/cmux.json`, the other in `~/.claude/settings.json`. Then:
+
+```sh
+cmux reload-config
+```
+
+Setup prints those snippets and nothing more — editing your config files is left to you.
+
+Already using a statusline command? Move it to `~/.config/cmux-claude-queue/statusline-chain`
+before step 3. It keeps running, cached for 180 s, with the queue row appended below its output.
+
+> **Password mode.** The cmux snippet turns on socket password control, so any process that can
+> read your `cmux.json` can drive your cmux terminals — check it is `chmod 600`. This is a wider
+> gate than cmux's default `cmuxOnly`, which rejects the hotkey daemon for not being a cmux child
+> process.
 
 <details>
 <summary>Or let your agent do it</summary>
