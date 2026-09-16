@@ -78,8 +78,8 @@ each Claude session has its own queue.
   transcript, which matches the prompt in full at any length, bounded by a timestamp so a
   deliberate repeat is not confirmed by its predecessor. The scan stops after 64 MiB; past that,
   or when the transcript is missing, cmux's `workspace.prompt.submitted` event is the fallback,
-  because its 240-character preview still identifies a long prompt. Slash commands emit no submit event at all,
-  so they are confirmed by the input box clearing instead.
+  because its 240-character preview still identifies a long prompt. Slash commands emit no submit
+  event at all, so they are confirmed by the input box clearing instead.
 - **Bounded resends.** A send whose text left the input box is treated as in flight — neither
   re-sent nor counted against the retry cap — because Claude Code's own mid-turn queue swallows
   a submit and emits no event until the turn ends. A late-arriving submit is detected rather than

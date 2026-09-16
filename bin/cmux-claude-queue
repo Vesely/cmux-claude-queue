@@ -1781,9 +1781,10 @@ deliver_once() {
       # "idle" is not positive evidence of an input box. session_state only
       # sees the last 2 MiB of events.jsonl, so a session whose events aged
       # out — or that was there when the log rotated — resolves to unknown,
-      # and unknown with a non-running lifecycle becomes idle. needsInput (a
-      # pending permission dialog) lands here too. Both get the same screen
-      # check as stale, because an Enter into a dialog answers the dialog.
+      # and unknown with a non-running lifecycle becomes idle — including a
+      # session sitting on a permission dialog, whose lifecycle is needsInput.
+      # So idle takes the same screen check as stale: an Enter into a dialog
+      # answers the dialog.
       #
       # "stale": hooks say running but nothing landed for 30+ s: either a long
       # tool-less streaming stretch (still running) or an Esc interrupt
@@ -1798,11 +1799,21 @@ deliver_once() {
       # a screen we cannot read is not a screen without a spinner: an empty
       # read-screen used to fall through the regex and be taken as "idle"
       screen=$("$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null)
-      [ -z "$screen" ] && { rm -rf "$lock"; return 1; }
+      if [ -z "$screen" ]; then
+        log "deliver surface=$surface holding: screen unreadable"
+        rm -rf "$lock"; return 1
+      fi
       if printf '%s' "$screen" | python3 -c '
 import re, sys
-sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]|Do you want to|don.t ask again", sys.stdin.read()) else 1)
-'; then rm -rf "$lock"; return 1; fi ;;
+# Our own statusline row goes first. It prints the head of this very queue
+# into this very surface, so a queued prompt containing "Do you want to"
+# matched the dialog guard against itself and held the queue forever.
+text = "\n".join(l for l in sys.stdin.read().split("\n") if "\u23f3 Queue:" not in l)
+sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]|Do you want to|don.t ask again", text) else 1)
+'; then
+        log "deliver surface=$surface holding: turn indicator or dialog on screen"
+        rm -rf "$lock"; return 1
+      fi ;;
   esac
 
   # never clobber a draft the user is typing
@@ -2110,7 +2121,8 @@ USAGE
     # take the lock first, or a delivery mid-pop writes the file back out
     if qlock_take "$surface"; then
       rm -f "$qf" "$QDIR/$surface.qoffset" "$QDIR/$surface.parked" \
-            "$QDIR/$surface.sends" "$QDIR/$surface.resend" "$QDIR/$surface.diverge"
+            "$QDIR/$surface.sends" "$QDIR/$surface.resend" "$QDIR/$surface.diverge" \
+            "$QDIR/$surface.attempt" "$QDIR/$surface.leftover" "$QDIR/$surface.holdoff"
       qlock_drop "$surface"
       log "clear surface=$surface dropped $n queued"
       echo "dropped $n queued for $surface"
