@@ -54,6 +54,23 @@ queue, and delivery targets that same surface.
 Both shortcuts are registered only while cmux is frontmost, so they behave normally everywhere
 else.
 
+<details>
+<summary>Or pick your own keys</summary>
+
+```sh
+echo 'ctrl+shift+enter' > ~/.config/cmux-claude-queue/hotkey-capture
+echo 'ctrl+shift+m'     > ~/.config/cmux-claude-queue/hotkey-manage
+```
+
+Modifiers are `cmd`, `opt`, `ctrl` and `shift`; keys are `enter`, `space`, `tab`, `esc`, `a`–`z`,
+`0`–`9` and `f1`–`f12`. At least one modifier is required, so a bare key cannot be swallowed
+inside cmux. A combo the daemon cannot parse is ignored in favour of the default, with a line in
+`~/.claude/prompt-queue/hotkeyd.err.log`.
+
+The change applies the next time cmux comes to the front. No restart, and nothing to reload.
+
+</details>
+
 ## Setup
 
 Needs macOS, [cmux](https://github.com/manaflow-ai/cmux) ≥ 0.64.20, Claude Code, `python3`, and

@@ -4,6 +4,8 @@
 // are registered:
 //   Opt+Return        -> capture the draft (queue it)
 //   Opt+Shift+Return  -> `cmux-claude-queue manage-open`  (queue manager pane)
+// Both are defaults; ~/.config/cmux-claude-queue/hotkey-capture and
+// hotkey-manage override them (see parseHotkey).
 // No action tab, no focus change. In every other app both combos are
 // unregistered, so they behave normally there.
 //
@@ -59,6 +61,11 @@ enum Paths {
     static let soundOptOut = tilde("~/.config/cmux-claude-queue/no-sound")
     // Escape hatch: forces every capture back through the spawned script.
     static let fastPathOptOut = tilde("~/.config/cmux-claude-queue/no-fastpath")
+    // One combo per file, e.g. `echo ctrl+shift+enter > hotkey-capture`.
+    // Absent or unparseable means the default. Re-read whenever cmux comes to
+    // the front, so an edit takes effect without restarting the daemon.
+    static let hotkeyCapture = tilde("~/.config/cmux-claude-queue/hotkey-capture")
+    static let hotkeyManage = tilde("~/.config/cmux-claude-queue/hotkey-manage")
     // Written at the keypress itself so the statusline placeholder row can
     // render on its very next refresh, before the capture has a target.
     static let captureStamp = queueDir + "/capturing.stamp"
@@ -615,19 +622,75 @@ final class FastCapture {
 
 private struct Hotkey {
     let id: UInt32
+    let keyCode: UInt32
     let modifiers: UInt32
     let action: String
     let sound: Bool
 }
 
-private let hotkeys: [Hotkey] = [
-    Hotkey(id: 1, modifiers: UInt32(optionKey), action: "capture", sound: true),
-    // the manager pane is its own visible feedback, no sound needed
-    Hotkey(id: 2, modifiers: UInt32(optionKey | shiftKey), action: "manage-open", sound: false),
+// "opt+enter", "ctrl+shift+k", "cmd+opt+space" — case and spacing free.
+// Returns nil for anything it does not fully understand, so a typo falls back
+// to the default rather than silently registering something else.
+private let namedKeys: [String: Int] = [
+    "enter": kVK_Return, "return": kVK_Return, "space": kVK_Space, "tab": kVK_Tab,
+    "esc": kVK_Escape, "escape": kVK_Escape,
+    "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E,
+    "f": kVK_ANSI_F, "g": kVK_ANSI_G, "h": kVK_ANSI_H, "i": kVK_ANSI_I, "j": kVK_ANSI_J,
+    "k": kVK_ANSI_K, "l": kVK_ANSI_L, "m": kVK_ANSI_M, "n": kVK_ANSI_N, "o": kVK_ANSI_O,
+    "p": kVK_ANSI_P, "q": kVK_ANSI_Q, "r": kVK_ANSI_R, "s": kVK_ANSI_S, "t": kVK_ANSI_T,
+    "u": kVK_ANSI_U, "v": kVK_ANSI_V, "w": kVK_ANSI_W, "x": kVK_ANSI_X, "y": kVK_ANSI_Y,
+    "z": kVK_ANSI_Z,
+    "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3, "4": kVK_ANSI_4,
+    "5": kVK_ANSI_5, "6": kVK_ANSI_6, "7": kVK_ANSI_7, "8": kVK_ANSI_8, "9": kVK_ANSI_9,
+    "f1": kVK_F1, "f2": kVK_F2, "f3": kVK_F3, "f4": kVK_F4, "f5": kVK_F5, "f6": kVK_F6,
+    "f7": kVK_F7, "f8": kVK_F8, "f9": kVK_F9, "f10": kVK_F10, "f11": kVK_F11, "f12": kVK_F12,
 ]
+
+private func parseHotkey(_ spec: String) -> (keyCode: UInt32, modifiers: UInt32)? {
+    var modifiers = 0
+    var keyCode: Int?
+    for rawPart in spec.lowercased().split(separator: "+") {
+        let part = rawPart.trimmingCharacters(in: .whitespaces)
+        switch part {
+        case "opt", "option", "alt": modifiers |= optionKey
+        case "cmd", "command": modifiers |= cmdKey
+        case "ctrl", "control": modifiers |= controlKey
+        case "shift": modifiers |= shiftKey
+        default:
+            // exactly one non-modifier: "opt+enter+k" is a typo, not a combo
+            guard keyCode == nil, let code = namedKeys[part] else { return nil }
+            keyCode = code
+        }
+    }
+    // a bare key with no modifier would swallow that key system-wide in cmux
+    guard let code = keyCode, modifiers != 0 else { return nil }
+    return (UInt32(code), UInt32(modifiers))
+}
+
+private func configuredHotkey(_ path: String, _ fallback: String) -> (UInt32, UInt32) {
+    guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
+        return parseHotkey(fallback).map { ($0.keyCode, $0.modifiers) }!
+    }
+    let spec = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let hk = parseHotkey(spec) { return (hk.keyCode, hk.modifiers) }
+    FileHandle.standardError.write(Data(
+        "ignoring unparseable hotkey \"\(spec)\" in \(path), using \(fallback)\n".utf8))
+    return parseHotkey(fallback).map { ($0.keyCode, $0.modifiers) }!
+}
+
+private func currentHotkeys() -> [Hotkey] {
+    let capture = configuredHotkey(Paths.hotkeyCapture, "opt+enter")
+    let manage = configuredHotkey(Paths.hotkeyManage, "opt+shift+enter")
+    return [
+        Hotkey(id: 1, keyCode: capture.0, modifiers: capture.1, action: "capture", sound: true),
+        // the manager pane is its own visible feedback, no sound needed
+        Hotkey(id: 2, keyCode: manage.0, modifiers: manage.1, action: "manage-open", sound: false),
+    ]
+}
 
 final class HotkeyDaemon {
     private var hotKeyRefs: [EventHotKeyRef] = []
+    private var active: [Hotkey] = currentHotkeys()
     private var lastFire = DispatchTime(uptimeNanoseconds: 0)
     private var children = Set<Process>()
     // Serial: two captures must never interleave requests on one connection,
@@ -671,10 +734,14 @@ final class HotkeyDaemon {
         let wanted = frontmost.map(targetBundleIDs.contains) ?? false
         if wanted { warmSocket() }
         if wanted && hotKeyRefs.isEmpty {
-            for hk in hotkeys {
+            // cmux coming to the front is the only moment a combo can become
+            // reachable, so it is also the cheapest moment to notice the
+            // config changed: no restart, no watcher, no cost while idle.
+            active = currentHotkeys()
+            for hk in active {
                 var ref: EventHotKeyRef?
                 let hotKeyID = EventHotKeyID(signature: OSType(0x4351_4844), id: hk.id) // "CQHD"
-                let status = RegisterEventHotKey(UInt32(kVK_Return), hk.modifiers,
+                let status = RegisterEventHotKey(hk.keyCode, hk.modifiers,
                                                  hotKeyID, GetEventDispatcherTarget(), 0, &ref)
                 if status != noErr || ref == nil {
                     // e.g. another app owns the combo system-wide; without this
@@ -691,7 +758,7 @@ final class HotkeyDaemon {
     }
 
     fileprivate func fire(id: UInt32) {
-        guard let hk = hotkeys.first(where: { $0.id == id }) else { return }
+        guard let hk = active.first(where: { $0.id == id }) else { return }
         // belt and braces: registration should already scope us to the targets
         guard let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
               targetBundleIDs.contains(front) else { return }

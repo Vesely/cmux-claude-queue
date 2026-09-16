@@ -34,7 +34,10 @@ hotkeyd ──warm socket──▶ read box ─▶ <surfaceId>.<ms>.spool ─▶
 
 - **`hotkeyd/main.swift`** — the daemon. Registers Opt+Return (capture) and Opt+Shift+Return
   (queue manager) via Carbon `RegisterEventHotKey` (no Accessibility permission needed), and
-  *only while cmux is frontmost*, so both combos behave normally in every other app. It
+  *only while cmux is frontmost*, so both combos behave normally in every other app. Both are
+  defaults: `~/.config/cmux-claude-queue/hotkey-capture` and `hotkey-manage` hold one combo each
+  (`ctrl+shift+enter`), re-read on every registration, so an edit lands the next time cmux is
+  activated. An unparseable combo loses to the default rather than registering something else. It
   performs the capture in-process over one warm authenticated control-socket connection:
   resolve the session, read the box, spool the draft, clear the box. Spawning a helper for that
   used to cost 100–500 ms of `fork`/`exec` plus interpreter startup before anything visible
