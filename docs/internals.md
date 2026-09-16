@@ -159,6 +159,8 @@ The shell parses the text first, so unbalanced quotes, `$` and backticks will no
 
 ## Command Palette fallback
 
-You can register a cmux action running `cmux-claude-queue capture` (type `command`, target
-`newTabInCurrentPane`) to trigger a capture without the daemon. This opens a short-lived tab; the
-hotkey path does not.
+You can register a cmux action running `cmux-claude-queue capture --close-tab` (type `command`,
+target `newTabInCurrentPane`) to trigger a capture without the daemon. This opens a short-lived
+tab; the hotkey path does not. `--close-tab` is what makes the tab close again — without it the
+command leaves whatever surface it ran in alone, so running `cmux-claude-queue` by hand in a
+shell is safe.

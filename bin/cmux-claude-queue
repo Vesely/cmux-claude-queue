@@ -66,6 +66,15 @@ mkdir -p "$QDIR"
 # in every open session, the capture at every keypress. Both arms are
 # self-contained; the capture arm falls through to the full CLI path below
 # when the socket fast path is unavailable.
+# Closing our own surface is right for the Command Palette action tab, which
+# cmux creates for this one command and nothing else. It is wrong everywhere
+# else, and CMUX_SURFACE_ID cannot tell the two apart: it is set in every cmux
+# terminal, so a bare `cmux-claude-queue` typed into a shell used to close that
+# shell's pane. Require the caller to opt in instead.
+CLOSE_TAB=""
+case " $* " in *" --close-tab "*) CLOSE_TAB="${CMUX_SURFACE_ID:-}" ;; esac
+export CMUX_CLAUDE_QUEUE_CLOSE_TAB="$CLOSE_TAB"
+
 case "${1:-capture}" in
   statusline)
     # Claude Code statusLine command: if the user had their own statusline
@@ -479,7 +488,7 @@ def finish():
         os.remove(surface_stamp)
     except OSError:
         pass
-    own = os.environ.get("CMUX_SURFACE_ID") or ""
+    own = os.environ.get("CMUX_CLAUDE_QUEUE_CLOSE_TAB") or ""
     if own:
         # Command Palette path: hand focus back and close our action tab
         for m, p in (("surface.focus", {"surface_id": target}),
@@ -1373,9 +1382,11 @@ PY
 # The timestamp bound is what makes it safe: the same text may well have been
 # sent before (a repeat is ordinary), and confirming on an older copy would
 # pop a line that never ran.
+# 0 = confirmed, 1 = the transcript was readable and does not contain it,
+# 2 = there is no transcript to ask. Only 2 may fall back to preview_confirm.
 transcript_confirm() {
   local tf
-  tf=$(transcript_path "$1") || return 1
+  tf=$(transcript_path "$1") || return 2
   TRANSCRIPT_MATCH_PY="$TRANSCRIPT_MATCH_PY" python3 - "$tf" "$2" "$3" <<'PY' 2>/dev/null
 import datetime, json, os, sys
 exec(os.environ["TRANSCRIPT_MATCH_PY"])
@@ -1414,8 +1425,15 @@ mtime_epoch() { /usr/bin/stat -f %Fm "$1" 2>/dev/null || echo 0; }
 # the fallback for them and for sessions with no transcript on disk.
 confirm_submit() {
   local sid="$1" offset="$2" line="$3" strict="${4:-loose}" since="${5:-0}"
-  transcript_confirm "$sid" "$line" "$since" && return 0
-  preview_confirm "$sid" "$line" "$since" && return 0
+  local tc
+  transcript_confirm "$sid" "$line" "$since"; tc=$?
+  [ "$tc" -eq 0 ] && return 0
+  # preview_confirm names a workspace and no surface (cmux leaves surface_id
+  # null on workspace.prompt.submitted), so two Claude panes sharing one
+  # workspace are indistinguishable there, and a short prompt submitted in the
+  # other pane matches this one exactly. Ask it only when the transcript could
+  # not answer at all — the case it was written for.
+  [ "$tc" -eq 2 ] && preview_confirm "$sid" "$line" "$since" && return 0
   # a rotated event log (cmux renames it to events.jsonl.1 at 16 MB) leaves
   # every stored offset past the end of the new file, where tail reads nothing
   [ "$offset" -gt "$(wc -c < "$EVENTS" 2>/dev/null || echo 0)" ] 2>/dev/null && offset=0
@@ -1622,7 +1640,7 @@ deliver_once() {
   local qfile="$QDIR/$surface.queue"
   local lock="$QDIR/$surface.lock"
   local afile="$QDIR/$surface.attempt"
-  local line box sid ctx verdict offset delivered oldpid is_slash ghost
+  local line box sid ctx verdict offset delivered oldpid is_slash ghost screen
   local sfile scount sprev
 
   [ -s "$qfile" ] || return 0
@@ -1735,8 +1753,15 @@ deliver_once() {
 
   case "$verdict" in
     running) rm -rf "$lock"; return 1 ;;
-    stale)
-      # hooks say running but nothing landed for 30+ s: either a long
+    stale|idle)
+      # "idle" is not positive evidence of an input box. session_state only
+      # sees the last 2 MiB of events.jsonl, so a session whose events aged
+      # out — or that was there when the log rotated — resolves to unknown,
+      # and unknown with a non-running lifecycle becomes idle. needsInput (a
+      # pending permission dialog) lands here too. Both get the same screen
+      # check as stale, because an Enter into a dialog answers the dialog.
+      #
+      # "stale": hooks say running but nothing landed for 30+ s: either a long
       # tool-less streaming stretch (still running) or an Esc interrupt
       # (idle). Only the TUI live-status line tells them apart — it exists
       # while a turn streams or runs tools, in several shapes:
@@ -1746,7 +1771,11 @@ deliver_once() {
       #                                            NO parentheses (hit live)
       # also refuse on a pending tool-permission dialog: it renders with no
       # spinner or timer, and an Enter sent into it would answer the dialog
-      if "$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null | python3 -c '
+      # a screen we cannot read is not a screen without a spinner: an empty
+      # read-screen used to fall through the regex and be taken as "idle"
+      screen=$("$CMUX_BIN" read-screen --surface "$surface" 2>/dev/null)
+      [ -z "$screen" ] && { rm -rf "$lock"; return 1; }
+      if printf '%s' "$screen" | python3 -c '
 import re, sys
 sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]|Do you want to|don.t ask again", sys.stdin.read()) else 1)
 '; then rm -rf "$lock"; return 1; fi ;;
@@ -1850,7 +1879,7 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
     rm -rf "$lock"
     return 1
   }
-  "$CMUX_BIN" send --surface "$surface" "$line" >>"$QDIR/log.txt" 2>&1 \
+  "$CMUX_BIN" send --surface "$surface" -- "$line" >>"$QDIR/log.txt" 2>&1 \
     || log "deliver surface=$surface send text rc=$?"
   # Verify the box holds exactly what was typed before committing the Enter:
   # keystrokes the user typed into the send gap would otherwise be submitted
@@ -2030,7 +2059,7 @@ case "$cmd" in
     if [ -z "$target" ]; then
       "$CMUX_BIN" notify --title "Queue" --body "No Claude session found in this workspace" --workspace "$ws" >/dev/null 2>&1
       log "capture ws=$ws: no claude session"
-      [ -n "${CMUX_SURFACE_ID:-}" ] && "$CMUX_BIN" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1
+      [ -n "$CLOSE_TAB" ] && "$CMUX_BIN" close-surface --surface "$CLOSE_TAB" >/dev/null 2>&1
       exit 0
     fi
 
@@ -2047,7 +2076,7 @@ case "$cmd" in
         "$CMUX_BIN" send-key --surface "$target" enter >/dev/null 2>&1
         log "capture surface=$target idle, submitted draft: $text"
       fi
-      [ -n "${CMUX_SURFACE_ID:-}" ] && "$CMUX_BIN" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1
+      [ -n "$CLOSE_TAB" ] && "$CMUX_BIN" close-surface --surface "$CLOSE_TAB" >/dev/null 2>&1
       exit 0
     fi
 
@@ -2096,7 +2125,7 @@ case "$cmd" in
       # the hook delivers right away; while truly running it no-ops
       "$CMUX_BIN" notify --title "cmux-claude-queue-tick" --body tick --surface "$target" >/dev/null 2>&1
     fi
-    [ -n "${CMUX_SURFACE_ID:-}" ] && "$CMUX_BIN" close-surface --surface "$CMUX_SURFACE_ID" >/dev/null 2>&1
+    [ -n "$CLOSE_TAB" ] && "$CMUX_BIN" close-surface --surface "$CLOSE_TAB" >/dev/null 2>&1
     exit 0
     ;;
 
@@ -2153,6 +2182,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     /usr/bin/find "$QDIR" \( \( -name '*.queue' -size 0 \) -o -name '*.attempt' \
       -o -name 'capturing-*.stamp' -o -name '*.qlock' -o -name '*.qoffset' \
       -o -name '*.diverge' -o -name '*.resend' -o -name 'sidmap-*' \
+      -o -name '*.lock' \
       -o -name '*.sends' -o -name '*.parked' \
       -o -name '*.leftover' -o -name '*.holdoff' \
       -o -name '*.spool' -o -name '*.spool.tmp' \) -mtime +1 -delete 2>/dev/null
@@ -2174,6 +2204,9 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     # queue format is one message per line: an embedded newline would split
     # one prompt into several deliveries
     text=$(printf '%s' "$*" | tr '\n' ' ')
+    # deliver_once returns without popping a blank line, so one sitting ahead
+    # of real work wedges the surface until housekeeping notices a day later
+    case "$text" in *[![:space:]]*) ;; *) log "refused a blank prompt for $surface"; exit 1 ;; esac
     if qlock_take "$surface"; then
       [ -s "$QDIR/$surface.queue" ] \
         || wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
@@ -2247,6 +2280,9 @@ print(json.dumps(d))' 2>/dev/null) || out=""
     surface="${2:?usage: cmux-claude-queue enqueue <surfaceId> <text>}"
     shift 2
     text=$(printf '%s' "$*" | tr '\n' ' ')
+    # deliver_once returns without popping a blank line, so one sitting ahead
+    # of real work wedges the surface until housekeeping notices a day later
+    case "$text" in *[![:space:]]*) ;; *) log "refused a blank prompt for $surface"; exit 1 ;; esac
     if qlock_take "$surface"; then
       [ -s "$QDIR/$surface.queue" ] \
         || wc -c < "$EVENTS" > "$QDIR/$surface.qoffset" 2>/dev/null
