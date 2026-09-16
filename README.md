@@ -2,7 +2,7 @@
 
 <h4 align="center">
   Press <code>Option+Enter</code> instead of <code>Enter</code>.<br>
-  A real queue, not steering: your prompt waits outside the session and is sent only once the running one has fully finished.
+  A real queue: your prompt waits outside the session and goes in as the <em>next</em> turn, never into the one already running.
 </h4>
 
 <p align="center">
@@ -54,7 +54,8 @@ queue, and delivery targets that same surface.
 
 Both shortcuts are registered only while cmux is frontmost, so they behave normally everywhere
 else. From a shell, `cmux-claude-queue list` shows everything queued and
-`cmux-claude-queue clear <surface>` drops one queue; `cmux-claude-queue help` lists the rest.
+`cmux-claude-queue clear <surface>` drops one (the id is what `list` prints);
+`cmux-claude-queue help` lists the rest.
 
 <details>
 <summary>Or pick your own keys</summary>
@@ -103,11 +104,14 @@ cmux reload-config
 
 Setup prints those snippets and nothing more — editing your config files is left to you.
 
-Already using a statusline command? Move it to `~/.config/cmux-claude-queue/statusline-chain`
-before step 3. It keeps running, cached for 180 s, with the queue row appended below its output.
+Already using a statusline command? Save it as a shell script at
+`~/.config/cmux-claude-queue/statusline-chain` before step 3 — it is run with `/bin/sh` and gets
+the statusline JSON on stdin. It keeps running, cached for 180 s, with the queue row appended
+below its output.
 
-> **Password mode.** The cmux snippet turns on socket password control, so any process that can
-> read your `cmux.json` can drive your cmux terminals — check it is `chmod 600`. This is a wider
+> **Password mode.** The cmux snippet turns on socket password control (setup generates the
+> password and prints it in the snippet), so any process that can read your `cmux.json` can drive
+> your cmux terminals — check it is `chmod 600`. This is a wider
 > gate than cmux's default `cmuxOnly`, which rejects the hotkey daemon for not being a cmux child
 > process.
 
@@ -131,7 +135,8 @@ git clone https://github.com/Vesely/cmux-claude-queue
 cd cmux-claude-queue && ./install.sh
 ```
 
-A clone is copied into `~/.local/bin`, so re-run `./install.sh` after a `git pull`. An npm
+A clone is copied into `~/.local/bin` — put that on your `PATH` for the shell subcommands; the
+hotkey and the LaunchAgent use absolute paths either way. Re-run `./install.sh` after a `git pull`. An npm
 install is symlinked, so `npm update -g` updates the script — but not the compiled daemon.
 Re-run `cmux-claude-queue setup` for that.
 
@@ -154,6 +159,10 @@ Re-run `cmux-claude-queue setup` for that.
 Your previous statusline command is in `~/.config/cmux-claude-queue/statusline-chain`. Copy it
 back into Claude Code's `settings.json` before you delete that directory.
 
+First unwire it: remove `notifications.hooks` from `cmux.json`, restore your `statusLine` in
+`settings.json`, and — if you turned it on only for this — put `automation.socketControlMode` back
+to `cmuxOnly` and delete `automation.socketPassword`. Then:
+
 ```sh
 launchctl bootout gui/$(id -u)/com.cmux-claude-queue.hotkeyd
 rm -f ~/Library/LaunchAgents/com.cmux-claude-queue.hotkeyd.plist
@@ -163,14 +172,13 @@ rm -rf ~/.claude/prompt-queue ~/.config/cmux-claude-queue
 npm uninstall -g cmux-claude-queue   # if installed from npm
 ```
 
-Then, by hand: remove `notifications.hooks` from `cmux.json`, restore `statusLine` in
-`settings.json`, and — if you turned it on only for this — put `automation.socketControlMode`
-back to `cmuxOnly` and delete `automation.socketPassword`.
+Doing it in that order matters: between deleting the binaries and unwiring the config, every
+cmux notification and every statusline refresh would run a file that is no longer there.
 
 ## Internals
 
 [docs/internals.md](docs/internals.md) covers the architecture, what delivery does and does not
-guarantee, the performance numbers, and two optional extras: `Ctrl+G` capture and `!qq`.
+guarantee, the performance numbers, and two optional extras: `!qq` and a Command Palette action.
 
 [NOTES.md](NOTES.md) is the field notes: the cmux and Claude Code behaviours that cost time to
 find out, kept because they outlive this implementation.

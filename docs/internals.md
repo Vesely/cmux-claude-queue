@@ -14,7 +14,7 @@ Opt+Enter
    │
    ▼
 hotkeyd ──warm socket──▶ read box ─▶ <surfaceId>.<ms>.spool ─▶ box cleared
- (Carbon hotkey,          (in-process, no spawn — ~10 ms to here)     │
+ (Carbon hotkey,          (in-process, no spawn — measured ~10 ms to here)     │
   cmux frontmost                                                     │
   only)                                                              ▼
                                             spool ──▶ ~/.claude/prompt-queue/<surfaceId>.queue
@@ -36,7 +36,7 @@ hotkeyd ──warm socket──▶ read box ─▶ <surfaceId>.<ms>.spool ─▶
   (queue manager) via Carbon `RegisterEventHotKey` (no Accessibility permission needed), and
   *only while cmux is frontmost*, so both combos behave normally in every other app. Both are
   defaults: `~/.config/cmux-claude-queue/hotkey-capture` and `hotkey-manage` hold one combo each
-  (`ctrl+shift+enter`), re-read on every registration, so an edit lands the next time cmux is
+  (e.g. `ctrl+shift+enter`), re-read on every registration, so an edit lands the next time cmux is
   activated. An unparseable combo loses to the default rather than registering something else. It
   performs the capture in-process over one warm authenticated control-socket connection:
   resolve the session, read the box, spool the draft, clear the box. Spawning a helper for that
@@ -116,7 +116,7 @@ every 15 s.
   with substring expansion, the session→surface lookup is a cached one-line file read. The queue
   row starts `python3` only in the session that owns a non-empty queue.
 - The chained statusline normally runs in a detached background job and the wrapper serves its
-  cached output, so the wrapper finishes in tens of milliseconds whatever the chain costs. A
+  cached output, so the wrapper was measured in the tens of milliseconds whatever the chain costs. A
   payload with no `session_id` has no cache to serve and falls back to running the chain inline.
   With many sessions open, caching the chain cuts how often it runs at all.
 - The notification hook reads the payload with `cat` and echoes it straight back for every foreign
@@ -142,5 +142,5 @@ The shell parses the text first, so unbalanced quotes, `$` and backticks will no
 You can register a cmux action running `cmux-claude-queue capture --close-tab` (type `command`,
 target `newTabInCurrentPane`) to trigger a capture without the daemon. This opens a short-lived
 tab; the hotkey path does not. `--close-tab` is what makes the tab close again — without it the
-command leaves whatever surface it ran in alone, so running `cmux-claude-queue` by hand in a
-shell is safe.
+command leaves whatever surface it ran in alone, so running `cmux-claude-queue capture` by hand
+in a shell is safe.
