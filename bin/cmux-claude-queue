@@ -1080,6 +1080,30 @@ running_note() {  # $1 = surface, $2 = queued line, $3 = verdict source
   log "deliver surface=$1 holding $(( ($(date +%s) - since) / 60 )) min, session running (verdict from $3): $2"
 }
 
+# Does the scraped box read as a prefix of the typed line? Spaces may be
+# missing from the scrape: it cannot tell a hard character wrap from a word
+# wrap that happens to fill the row exactly, so a row ending at the box edge
+# comes back without the space at the break — hit live, "si říkám že bychom"
+# scraped as "si říkám žebychom", 710 characters against 711, and the prompt
+# parked after three tries. Nothing may be EXTRA, not even a space: whatever
+# the user typed into the send gap would be submitted with the prompt, and a
+# submit that differs from the queued text never confirms, so the line would
+# later go out a second time. Prints "yes" on a match; no output (python
+# missing included) reads as a divergence, which only holds the Enter back.
+box_prefix_of() {  # $1 = typed line, $2 = scraped box
+  python3 -c '
+import sys
+line, box = sys.argv[1], sys.argv[2]
+i = 0
+for ch in box:
+    while i < len(line) and line[i] == " " and ch != " ":
+        i += 1
+    if i >= len(line) or line[i] != ch:
+        sys.exit(1)
+    i += 1
+print("yes")' "$1" "$2" 2>/dev/null
+}
+
 # Is what the input box shows a Claude Code prompt SUGGESTION rather than a
 # typed draft? The suggestion scrapes exactly like a draft (same ❯ prefix; no
 # style attribute survives read-screen), but it is display-only over an EMPTY
@@ -2019,15 +2043,8 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   # shows as a prefix of the line and is accepted; anything else aborts and
   # leaves the typed text visible in the box for the user to resolve.
   box=$(read_box "$surface")
-  # Compare with the spaces taken out. The scrape cannot tell a hard character
-  # wrap from a word wrap that happens to fill the row exactly, so a row
-  # ending at the box edge comes back with the space at the break missing and
-  # the read-back never matches — hit live, "si říkám že bychom" scraped as
-  # "si říkám žebychom", 710 characters against 711, and the prompt parked
-  # after three tries. Keystrokes typed into the send gap add characters, so
-  # they still fail this test and still abort.
-  case "${line// /}" in
-    "${box// /}"*) : ;;
+  case "$(box_prefix_of "$line" "$box")" in
+    yes) : ;;
     *)
       log "deliver surface=$surface box diverged after typing, not submitting"
       # what stays in the box is ours; without this record the guard above
