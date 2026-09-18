@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  For <a href="https://claude.com/claude-code">Claude Code</a> running in <a href="https://cmux.io">cmux</a>.
+  For <a href="https://claude.com/claude-code">Claude Code</a> running in <a href="https://cmux.com">cmux</a>.
 </p>
 
 ## Why not the built-in queue

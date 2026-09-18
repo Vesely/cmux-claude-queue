@@ -1907,7 +1907,20 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   { printf '%s\n' "$scount"; printf '%s\n' "$line"; } > "$sfile"
 
   offset=$(events_size)
-  "$CMUX_BIN" send --surface "$surface" $'\x15' >>"$QDIR/log.txt" 2>&1 || {
+  # Clear the WHOLE box, not just its last row. Ctrl+U alone kills one line —
+  # the capture path learned that already — so a multi-row leftover survived
+  # it and the next send stacked another copy on top of what was still there
+  # (hit live: three copies of one prompt in one box). Same cycle capture
+  # uses: Ctrl+K, Ctrl+U, Backspace per row, every key a no-op once the box is
+  # empty, so overshooting the row count is free.
+  clear_cycles=$(( ${#box} / 60 + 4 ))
+  [ "$clear_cycles" -gt 40 ] && clear_cycles=40
+  clear_keys=""
+  while [ "$clear_cycles" -gt 0 ]; do
+    clear_keys="$clear_keys"$'\x0b\x15\x7f'
+    clear_cycles=$((clear_cycles - 1))
+  done
+  "$CMUX_BIN" send --surface "$surface" "$clear_keys" >>"$QDIR/log.txt" 2>&1 || {
     # surface gone or rejecting input (cmux restart, closed pane): skip the
     # whole confirm cycle instead of burning ~7 s against it every tick
     log "deliver surface=$surface send clear failed, skipping"
@@ -1923,8 +1936,15 @@ sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s
   # shows as a prefix of the line and is accepted; anything else aborts and
   # leaves the typed text visible in the box for the user to resolve.
   box=$(read_box "$surface")
-  case "$line" in
-    "$box"*) : ;;
+  # Compare with the spaces taken out. The scrape cannot tell a hard character
+  # wrap from a word wrap that happens to fill the row exactly, so a row
+  # ending at the box edge comes back with the space at the break missing and
+  # the read-back never matches — hit live, "si říkám že bychom" scraped as
+  # "si říkám žebychom", 710 characters against 711, and the prompt parked
+  # after three tries. Keystrokes typed into the send gap add characters, so
+  # they still fail this test and still abort.
+  case "${line// /}" in
+    "${box// /}"*) : ;;
     *)
       log "deliver surface=$surface box diverged after typing, not submitting"
       # what stays in the box is ours; without this record the guard above
