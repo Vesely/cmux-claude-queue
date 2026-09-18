@@ -46,7 +46,7 @@ current task … This makes it super unreliable."* Still open:
 
 | Key | What happens |
 | --- | --- |
-| `Option+Enter` | Queues the draft. The box clears at once; the statusline shows `⏳ Queue: …` |
+| `Option+Enter` | Queues the draft. The box clears at once; the statusline shows `⏳ Queue: …`, and after a minute how long it has waited |
 | `Option+Shift+Enter` | Opens the queue manager: `↑↓` select, `e` edit, `d` delete, `q` close |
 
 On an idle session `Option+Enter` acts like plain `Enter`. Each cmux surface has its own FIFO

@@ -258,8 +258,10 @@ case "${1:-help}" in
     # pending queue — not in every session that refreshes while some queue
     # is waiting
     { [ -z "$surf" ] || [ ! -s "$QDIR/$surf.queue" ]; } && exit 0
+    # the wait shows once it passes a minute: a row that sat unchanged for
+    # eight hours looked exactly like one queued a second ago
     out=$(python3 -c '
-import sys
+import os, sys, time
 try:
     with open(sys.argv[1]) as f:
         items = [l.strip() for l in f if l.strip()]
@@ -268,9 +270,17 @@ try:
     DIM, YEL, RST = "\033[2m", "\033[33m", "\033[0m"
     nxt = items[0][:70] + ("…" if len(items[0]) > 70 else "")
     more = f" {DIM}+{len(items) - 1} more{RST}" if len(items) > 1 else ""
-    print(f"{YEL}⏳ Queue:{RST} {nxt}{more}")
+    # .qoffset is rewritten when the queue fills from empty and after every
+    # delivery pop: the age is how long the queue has gone without moving
+    try:
+        since = os.path.getmtime(sys.argv[2])
+    except OSError:
+        since = os.path.getmtime(sys.argv[1])
+    mins = int(time.time() - since) // 60
+    age = "" if mins < 1 else f" ({mins} min)" if mins < 60 else f" ({mins // 60} h)"
+    print(f"{YEL}⏳ Queue{age}:{RST} {nxt}{more}")
 except Exception:
-    pass' "$QDIR/$surf.queue" 2>/dev/null)
+    pass' "$QDIR/$surf.queue" "$QDIR/$surf.qoffset" 2>/dev/null)
     [ -z "$out" ] && exit 0
     printf '%s\n' "$out"
     # delivery pump: an Esc interrupt kills a turn WITHOUT any Stop hook or
@@ -1055,6 +1065,21 @@ holdoff_warn() {  # $1 = surface, $2 = queued line
   fi
 }
 
+# A line held behind a "running" verdict leaves no other trace. That is right
+# for an ordinary turn, but a verdict stuck at running once held a line for
+# eight hours with nothing in the log. Once the line has waited ten minutes,
+# note it every ten, with where the verdict came from.
+running_note() {  # $1 = surface, $2 = queued line, $3 = verdict source
+  local nfile="$QDIR/$1.runnote" since
+  since=$(mtime_epoch "$QDIR/$1.qoffset"); since=${since%.*}
+  [ "$since" -gt 0 ] 2>/dev/null \
+    || { since=$(mtime_epoch "$QDIR/$1.queue"); since=${since%.*}; }
+  [ $(( $(date +%s) - since )) -ge 600 ] 2>/dev/null || return 0
+  [ -n "$(/usr/bin/find "$nfile" -newermt '-10 minutes' 2>/dev/null)" ] && return 0
+  : > "$nfile"
+  log "deliver surface=$1 holding $(( ($(date +%s) - since) / 60 )) min, session running (verdict from $3): $2"
+}
+
 # Is what the input box shows a Claude Code prompt SUGGESTION rather than a
 # typed draft? The suggestion scrapes exactly like a draft (same ❯ prefix; no
 # style attribute survives read-screen), but it is display-only over an EMPTY
@@ -1161,6 +1186,37 @@ events_running() {
   return 1
 }
 
+# Python source shared by every reader that matches a hook event to a session
+# (injected like TRANSCRIPT_MATCH_PY below). cmux (seen on 0.64.25) stopped
+# writing the payload's session_id as "claude-<uuid>" and writes
+# "cmux-feed-v1:<base64 source>:<base64 uuid>" instead. Compared against the
+# old shape, no event matched any more, the running verdict fell back to the
+# store, and a queued line waited eight hours without a single log entry.
+# Both shapes come out as "claude-<uuid>".
+IFS= read -r -d '' HOOK_SID_PY <<'PYFRAG' || :
+def hook_sid(payload):
+    v = (payload or {}).get("session_id") or ""
+    if v.startswith("cmux-feed-v1:"):
+        import base64
+        try:
+            src, uid = v.split(":")[1:3]
+            dec = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode()
+            return dec(src) + "-" + dec(uid)
+        except Exception:
+            return v
+    return v
+
+# Byte strings, any of which may mark a raw event line as this session's: the
+# old literal (which cmux also still writes inside _opencode_request_id) and
+# the base64 uuid of the feed-v1 shape. A prefilter on the literal alone would
+# stop matching the day that other field goes away.
+def sid_needles(sid):
+    import base64
+    uid = (sid[7:] if sid.startswith("claude-") else sid).encode()
+    return (sid.encode(), base64.b64encode(uid).rstrip(b"="),
+            base64.urlsafe_b64encode(uid).rstrip(b"="))
+PYFRAG
+
 # Session id + turn verdict for a surface, in ONE python process (this runs on
 # every delivery tick, and interpreter startup dominates on a loaded machine).
 # Hook events are the primary truth (newest UserPromptSubmit vs Stop), BUT an
@@ -1179,47 +1235,68 @@ events_running() {
 # never seen. Hit live: a 20-minute turn (last submit 15:29:51,
 # PreToolUse at 15:50:31) was judged idle at 15:50:32, the delivery went into
 # Claude Code's own mid-turn queue and the prompt reached Claude twice.
-# Prints "<sid>\x1f<idle|running|stale>".
+#
+# The store fallback cannot take agentLifecycle at its word either: cmux keeps
+# a session "running" after a Stop that left background work behind (shells or
+# agents the turn started), although the turn is over and the box takes input.
+# Exactly that record (last hook Stop, hadPendingBackgroundWorkAtStop true)
+# counts as idle; the screen check in deliver_once still has the final say.
+# Prints "<sid>\x1f<idle|running|stale>\x1f<where the verdict came from>".
 session_state() {
-  python3 - "$STORE" "$1" "$EVENTS" <<'PY' 2>/dev/null
-import datetime, json, sys
+  HOOK_SID_PY="$HOOK_SID_PY" python3 - "$STORE" "$1" "$EVENTS" <<'PY' 2>/dev/null
+import datetime, json, os, sys
+exec(os.environ["HOOK_SID_PY"])
 store, surface, events = sys.argv[1:4]
 sid = ""
 lifecycle = "unknown"
+bg_stop = False
 try:
     d = json.load(open(store))
     sid = d.get("activeSessionsBySurface", {}).get(surface, {}).get("sessionId") or ""
     if sid.startswith("claude-"):
         sid = sid[7:]
-    lifecycle = d.get("sessions", {}).get(sid, {}).get("agentLifecycle", "unknown")
+    sess = d.get("sessions", {}).get(sid, {})
+    lifecycle = sess.get("agentLifecycle", "unknown")
+    bg_stop = sess.get("hookEventName") == "Stop" \
+        and sess.get("hadPendingBackgroundWorkAtStop") is True
 except Exception:
     pass
 verdict = "unknown"
+source = "store"
 if sid:
     needle = ("claude-" + sid).encode()
+    needles = sid_needles(needle.decode())
     last = None   # newest decisive event: UserPromptSubmit or Stop
     beat = None   # newest hook event of any kind = the session is still alive
+    unparsed = 0  # hook events that name the session but not in a readable form
     try:
         f = open(events, "rb")
         f.seek(0, 2)
         f.seek(max(0, f.tell() - 2097152))
         for line in f.read().splitlines():
-            if needle not in line or b'"agent.hook.' not in line:
+            if b'"agent.hook.' not in line or not any(n in line for n in needles):
                 continue
             try:
                 e = json.loads(line)
             except Exception:
                 continue
             name = e.get("name") or ""
-            if not name.startswith("agent.hook.") \
-               or (e.get("payload") or {}).get("session_id") != needle.decode():
+            if not name.startswith("agent.hook."):
+                continue
+            if hook_sid(e.get("payload")) != needle.decode():
+                unparsed += 1
                 continue
             beat = e
             if name in ("agent.hook.UserPromptSubmit", "agent.hook.Stop"):
                 last = e
     except Exception:
         pass
+    if beat is None and unparsed:
+        # the canary for the next payload change: the log mentions this
+        # session, yet no event reads as its own
+        source = "store, %d hook events unreadable" % unparsed
     if last is not None:
+        source = "events"
         if last["name"] == "agent.hook.Stop":
             verdict = "idle"
         else:
@@ -1234,8 +1311,8 @@ if sid:
                 age = 0
             verdict = "running" if age < 30 else "stale"
 if verdict == "unknown":
-    verdict = "running" if lifecycle == "running" else "idle"
-print(sid + "\x1f" + verdict)
+    verdict = "running" if lifecycle == "running" and not bg_stop else "idle"
+print(sid + "\x1f" + verdict + "\x1f" + source)
 PY
 }
 
@@ -1461,14 +1538,16 @@ confirm_submit() {
   # a rotated event log (cmux renames it to events.jsonl.1 at 16 MB) leaves
   # every stored offset past the end of the new file, where tail reads nothing
   [ "$offset" -gt "$(events_size)" ] 2>/dev/null && offset=0
-  tail -c "+$((offset + 1))" "$EVENTS" 2>/dev/null | python3 -c '
-import json, sys
+  tail -c "+$((offset + 1))" "$EVENTS" 2>/dev/null | HOOK_SID_PY="$HOOK_SID_PY" python3 -c '
+import json, os, sys
+exec(os.environ["HOOK_SID_PY"])
 sid, text, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+needles = [n.decode() for n in sid_needles(sid)]
 # cmux serializes tool_input compactly: {"prompt":"..."} with no spaces
 lens = {len(json.dumps({"prompt": text}, separators=(",", ":"))),
         len(json.dumps({"prompt": text}, separators=(",", ":"), ensure_ascii=False))}
 for raw in sys.stdin:
-    if "UserPromptSubmit" not in raw or sid not in raw:
+    if "UserPromptSubmit" not in raw or not any(n in raw for n in needles):
         continue
     try:
         d = json.loads(raw)
@@ -1477,7 +1556,7 @@ for raw in sys.stdin:
     if d.get("name") != "agent.hook.UserPromptSubmit":
         continue
     p = d.get("payload") or {}
-    if p.get("session_id") != sid:
+    if hook_sid(p) != sid:
         continue
     til = p.get("tool_input_length")
     if mode == "strict" and til not in lens:
@@ -1500,13 +1579,15 @@ sys.exit(1)' "claude-$sid" "$line" "$strict"
 # Long prompts are invisible in the event log — see confirm_submit — so for
 # them the transcript is the only signal that can ever fire here.
 confirm_wait() {
-  TRANSCRIPT_MATCH_PY="$TRANSCRIPT_MATCH_PY" \
+  TRANSCRIPT_MATCH_PY="$TRANSCRIPT_MATCH_PY" HOOK_SID_PY="$HOOK_SID_PY" \
     python3 - "$EVENTS" "claude-$1" "$2" "$3" "$(transcript_path "$1" || true)" \
     <<'PY' 2>/dev/null
 import datetime, json, os, sys, time
 exec(os.environ["TRANSCRIPT_MATCH_PY"])
+exec(os.environ["HOOK_SID_PY"])
 events, sid, offset, text = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 tpath = sys.argv[5]
+needles = sid_needles(sid)
 # taken here rather than passed in: this runs immediately after the Enter, and
 # a shell `date +%s` would round down to the top of its second, widening the
 # window into prompts submitted before ours
@@ -1532,7 +1613,7 @@ while True:
         nl = chunk.rfind(b"\n")  # complete lines only; tail re-read next poll
         if nl >= 0:
             for raw in chunk[:nl].splitlines():
-                if b"UserPromptSubmit" not in raw or sid.encode() not in raw:
+                if b"UserPromptSubmit" not in raw or not any(n in raw for n in needles):
                     continue
                 try:
                     d = json.loads(raw)
@@ -1540,7 +1621,7 @@ while True:
                     continue
                 p = d.get("payload") or {}
                 if d.get("name") == "agent.hook.UserPromptSubmit" \
-                   and p.get("session_id") == sid \
+                   and hook_sid(p) == sid \
                    and p.get("tool_input_length") in lens:
                     sys.exit(0)
             pos += nl + 1
@@ -1664,7 +1745,7 @@ deliver_once() {
   local qfile="$QDIR/$surface.queue"
   local lock="$QDIR/$surface.lock"
   local afile="$QDIR/$surface.attempt"
-  local line box sid ctx verdict offset delivered oldpid is_slash ghost screen
+  local line box sid ctx verdict vsource offset delivered oldpid is_slash ghost screen
   local sfile scount sprev
 
   [ -s "$qfile" ] || return 0
@@ -1721,6 +1802,8 @@ deliver_once() {
   ctx=$(session_state "$surface")
   sid=${ctx%%$'\x1f'*}
   verdict=${ctx#*$'\x1f'}
+  vsource=${verdict#*$'\x1f'}
+  verdict=${verdict%%$'\x1f'*}
   if [ -z "$sid" ]; then
     # without a session id we can neither check running-state nor confirm a
     # submit — sending keys blind risks steering; wait for a later tick
@@ -1776,7 +1859,7 @@ deliver_once() {
   fi
 
   case "$verdict" in
-    running) rm -rf "$lock"; return 1 ;;
+    running) running_note "$surface" "$line" "$vsource"; rm -rf "$lock"; return 1 ;;
     stale|idle)
       # "idle" is not positive evidence of an input box. session_state only
       # sees the last 2 MiB of events.jsonl, so a session whose events aged
@@ -1808,7 +1891,7 @@ import re, sys
 # Our own statusline row goes first. It prints the head of this very queue
 # into this very surface, so a queued prompt containing "Do you want to"
 # matched the dialog guard against itself and held the queue forever.
-text = "\n".join(l for l in sys.stdin.read().split("\n") if "\u23f3 Queue:" not in l)
+text = "\n".join(l for l in sys.stdin.read().split("\n") if "\u23f3 Queue" not in l)
 sys.exit(0 if re.search(r"esc to interrupt|\(\d+m? ?\d*s\s*·|\d+m? ?\d*s\s*·\s*[↓↑]|Do you want to|don.t ask again", text) else 1)
 '; then
         log "deliver surface=$surface holding: turn indicator or dialog on screen"
@@ -2317,7 +2400,7 @@ print(json.dumps(d))' 2>/dev/null) || out=""
       -o -name '*.diverge' -o -name '*.resend' -o -name 'sidmap-*' \
       -o -name '*.lock' \
       -o -name '*.sends' -o -name '*.parked' \
-      -o -name '*.leftover' -o -name '*.holdoff' \
+      -o -name '*.leftover' -o -name '*.holdoff' -o -name '*.runnote' \
       -o -name '*.spool' -o -name '*.spool.tmp' \) -mtime +1 -delete 2>/dev/null
     for qf in "$QDIR"/*.queue; do
       [ -s "$qf" ] || continue
